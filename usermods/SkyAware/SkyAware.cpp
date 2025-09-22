@@ -495,7 +495,7 @@ public:
       r->send(200, "text/plain", "SkyAware log cleared");
     });
 
-server.on("/um/skyaware", HTTP_GET, [this](AsyncWebServerRequest* r){
+server.on("/skyaware/status", HTTP_GET, [this](AsyncWebServerRequest* r){
   String html =
     "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<style>"
