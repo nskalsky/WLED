@@ -19,17 +19,17 @@
 // -D WLED_BRAND="\"Custom Brand\""
 // -D WLED_PRODUCT_NAME="\"Custom Product\""
 #ifndef WLED_BRAND
-  #define WLED_BRAND "WLED"
+  #define WLED_BRAND "SKYAWARE"
 #endif
 #ifndef WLED_PRODUCT_NAME
-  #define WLED_PRODUCT_NAME "FOSS"
+  #define WLED_PRODUCT_NAME "SKYA"
 #endif
 
 //Defaults
 #define DEFAULT_CLIENT_SSID "Your_Network"
 #define DEFAULT_AP_SSID     WLED_BRAND "-AP"
-#define DEFAULT_AP_PASS     "wled1234"
-#define DEFAULT_OTA_PASS    "wledota"
+#define DEFAULT_AP_PASS     ""
+#define DEFAULT_OTA_PASS    ""
 #define DEFAULT_MDNS_NAME   "x"
 
 //increase if you need more

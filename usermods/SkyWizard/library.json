@@ -1,0 +1,8 @@
+{
+  "name": "SkyWizard",
+  "version": "0.1.0",
+  "description": "First-run wizard for WLED to set a Home Airport (optional) before Wi-Fi setup.",
+  "build": {
+    "libArchive": false
+  }
+}

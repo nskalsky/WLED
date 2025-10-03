@@ -495,6 +495,45 @@ public:
       r->send(200, "text/plain", "SkyAware log cleared");
     });
 
+    server.on("/um/skywizard/get", HTTP_GET, [this](AsyncWebServerRequest* r){
+  String json = String("{\"airport\":\"") + airportId + "\"}";
+  r->send(200, "application/json", json);
+});
+
+
+        // Let the captive page save the SAME settings as /settings/um
+    server.on("/um/skywizard/save", HTTP_POST, [this](AsyncWebServerRequest* r){
+      auto get = [&](const char* name)->String{
+        if (r->hasParam(name, true)) return r->getParam(name, true)->value();
+        if (r->hasParam(name))       return r->getParam(name)->value();
+        return String();
+      };
+
+      // Only set what you care about (airport). You can add more later.
+      String a = get("airport");
+      a.trim(); a.toUpperCase();
+
+      // basic validation: 3–8 alnum
+      bool ok = (a.length()>=3 && a.length()<=8);
+      for (size_t i=0; i<a.length() && ok; i++) {
+        char c=a[i]; ok = ((c>='A'&&c<='Z')||(c>='0'&&c<='9'));
+      }
+      if (ok) {
+        airportId = a;              // update runtime field used by your usermod
+      }
+
+      // Persist using WLED's normal config save (same effect as /settings/um -> Save)
+      //saveSettingsToEEPROM();       // <— this is the standard WLED call
+
+      // go where you want next (default to Wi-Fi setup)
+      String redir = get("redir");
+      if (!redir.length()) redir = "/settings/wifi";
+      auto* resp = r->beginResponse(302, "text/plain", "saved");
+      resp->addHeader("Location", redir);
+      r->send(resp);
+    });
+
+
 server.on("/skyaware/status", HTTP_GET, [this](AsyncWebServerRequest* r){
   String html =
     "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
