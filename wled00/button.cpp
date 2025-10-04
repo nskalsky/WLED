@@ -4,23 +4,64 @@
  * Physical IO
  */
 
-#define WLED_DEBOUNCE_THRESHOLD      50 // only consider button input of at least 50ms as valid (debouncing)
-#define WLED_LONG_PRESS             600 // long press if button is released after held for at least 600ms
-#define WLED_DOUBLE_PRESS           350 // double press if another press within 350ms after a short press
-#define WLED_LONG_REPEATED_ACTION   400 // how often a repeated action (e.g. dimming) is fired on long press on button IDs >0
-#define WLED_LONG_AP               5000 // how long button 0 needs to be held to activate WLED-AP
-#define WLED_LONG_FACTORY_RESET   10000 // how long button 0 needs to be held to trigger a factory reset
-#define WLED_LONG_BRI_STEPS          16 // how much to increase/decrease the brightness with each long press repetition
+#define WLED_DEBOUNCE_THRESHOLD      50  // only consider button input of at least 50ms as valid (debouncing)
+#define WLED_LONG_PRESS             600  // long press if button is released after held for at least 600ms
+#define WLED_DOUBLE_PRESS           350  // double press if another press within 350ms after a short press
+#define WLED_LONG_REPEATED_ACTION   400  // how often a repeated action (e.g. dimming) is fired on long press on button IDs >0
+#define WLED_LONG_AP               5000  // how long button 0 needs to be held to activate WLED-AP
+#define WLED_LONG_FACTORY_RESET   10000  // how long button 0 needs to be held to trigger a factory reset
+#define WLED_LONG_BRI_STEPS          16  // (unused now for button 0) how much to increase/decrease the brightness with each long press repetition
 
 static const char _mqtt_topic_button[] PROGMEM = "%s/button/%d";  // optimize flash usage
-static bool buttonBriDirection = false; // true: increase brightness, false: decrease brightness
+static bool buttonBriDirection = false; // legacy (kept to avoid broader diffs)
+
+// ---- Brightness cycle steps for short-press on button 0 ----
+static const uint8_t BRIGHTNESS_STEPS[] = { 0, 32, 85, 170, 255 };
+static const uint8_t NUM_BRIGHTNESS_STEPS = sizeof(BRIGHTNESS_STEPS) / sizeof(BRIGHTNESS_STEPS[0]);
+
+// Helper: given current 'bri', choose the next step in BRIGHTNESS_STEPS
+static inline uint8_t nextBrightnessStep(uint8_t current)
+{
+  // Find the first step >= current; advance to the next (wrap)
+  for (uint8_t i = 0; i < NUM_BRIGHTNESS_STEPS; i++) {
+    if (current <= BRIGHTNESS_STEPS[i]) {
+      return BRIGHTNESS_STEPS[(i + 1) % NUM_BRIGHTNESS_STEPS];
+    }
+  }
+  // If current > last step (shouldn’t happen in practice), wrap to first
+  return BRIGHTNESS_STEPS[0];
+}
 
 void shortPressAction(uint8_t b)
 {
   if (!macroButton[b]) {
     switch (b) {
-      case 0: toggleOnOff(); stateUpdated(CALL_MODE_BUTTON); break;
-      case 1: ++effectCurrent %= strip.getModeCount(); stateChanged = true; colorUpdated(CALL_MODE_BUTTON); break;
+      case 0: {
+        // Cycle brightness Off → Low → Medium → Bright → Super Bright → Off
+        uint8_t cur = bri;
+        uint8_t nxt = nextBrightnessStep(cur);
+
+        // If we’re turning off, remember the last non-zero brightness
+        if (nxt == 0 && cur > 0) {
+          briLast = cur;
+        }
+
+        // If we’re turning on from 0, restart runtime so transitions/effects behave
+        if (cur == 0 && nxt > 0) {
+          strip.restartRuntime();
+        }
+
+        bri = nxt;
+        stateUpdated(CALL_MODE_BUTTON);  // triggers update & interfaces
+        break;
+      }
+
+      // Keep existing default for a second button if present (effect next)
+      case 1:
+        ++effectCurrent %= strip.getModeCount();
+        stateChanged = true;
+        colorUpdated(CALL_MODE_BUTTON);
+        break;
     }
   } else {
     applyPreset(macroButton[b], CALL_MODE_BUTTON_PRESET);
@@ -38,23 +79,11 @@ void shortPressAction(uint8_t b)
 
 void longPressAction(uint8_t b)
 {
+  // Intentionally do nothing on press/hold; we keep AP/factory reset behavior
+  // which is handled on RELEASE in handleButton() based on duration.
   if (!macroLongPress[b]) {
-    switch (b) {
-      case 0: setRandomColor(colPri); colorUpdated(CALL_MODE_BUTTON); break;
-      case 1: 
-        if(buttonBriDirection) {
-          if (bri == 255) break; // avoid unnecessary updates to brightness
-          if (bri >= 255 - WLED_LONG_BRI_STEPS) bri = 255;
-          else bri += WLED_LONG_BRI_STEPS;
-        } else {
-          if (bri == 1) break; // avoid unnecessary updates to brightness
-          if (bri <= WLED_LONG_BRI_STEPS) bri = 1;
-          else bri -= WLED_LONG_BRI_STEPS;
-        }
-        stateUpdated(CALL_MODE_BUTTON); 
-        buttonPressedTime[b] = millis();         
-        break; // repeatable action
-    }
+    // No-op: removed random color (button 0) and long-press dimming (button 1)
+    // to satisfy "medium presses do nothing".
   } else {
     applyPreset(macroLongPress[b], CALL_MODE_BUTTON_PRESET);
   }
@@ -73,8 +102,11 @@ void doublePressAction(uint8_t b)
 {
   if (!macroDoublePress[b]) {
     switch (b) {
-      //case 0: toggleOnOff(); colorUpdated(CALL_MODE_BUTTON); break; //instant short press on button 0 if no macro set
-      case 1: ++effectPalette %= getPaletteCount(); colorUpdated(CALL_MODE_BUTTON); break;
+      // leave button 0 double-press unused by default to avoid conflicts with short-press cycling
+      case 1:
+        ++effectPalette %= getPaletteCount();
+        colorUpdated(CALL_MODE_BUTTON);
+        break;
     }
   } else {
     applyPreset(macroDoublePress[b], CALL_MODE_BUTTON_PRESET);
@@ -196,13 +228,6 @@ void handleAnalog(uint8_t b)
   DEBUG_PRINTF_P(PSTR("Analog: Raw = %u\n"), rawReading);
   DEBUG_PRINTF_P(PSTR(" Filtered = %u\n"), aRead);
 
-  // Unomment the next lines if you still see flickering related to potentiometer
-  // This waits until strip finishes updating (why: strip was not updating at the start of handleButton() but may have started during analogRead()?)
-  //unsigned long wait_started = millis();
-  //while(strip.isUpdating() && (millis() - wait_started < STRIP_WAIT_TIME)) {
-  //  delay(1);
-  //}
-
   oldRead[b] = aRead;
 
   // if no macro for "short press" and "long press" is defined use brightness control
@@ -298,13 +323,14 @@ void handleButton()
       if (!buttonPressedBefore[b]) buttonPressedTime[b] = now;
       buttonPressedBefore[b] = true;
 
-      if (now - buttonPressedTime[b] > WLED_LONG_PRESS) { //long press
+      if (now - buttonPressedTime[b] > WLED_LONG_PRESS) { // long press (hold)
         if (!buttonLongPressed[b]) {
-          buttonBriDirection = !buttonBriDirection; //toggle brightness direction on long press
+          // We deliberately do not change brightness or color on long-press anymore.
+          // Keep this call to emit MQTT "long" (and to allow user-defined macroLongPress if set).
           longPressAction(b);
-        } else if (b) { //repeatable action (~5 times per s) on button > 0
+        } else if (b) { // repeated action previously handled dimming; now no-op
           longPressAction(b);
-          buttonPressedTime[b] = now - WLED_LONG_REPEATED_ACTION; //200ms
+          buttonPressedTime[b] = now - WLED_LONG_REPEATED_ACTION; // keep timing consistent
         }
         buttonLongPressed[b] = true;
       }
@@ -332,11 +358,11 @@ void handleButton()
         } else {
           WLED::instance().initAP(true);
         }
-      } else if (!buttonLongPressed[b]) { //short press
-        //NOTE: this interferes with double click handling in usermods so usermod needs to implement full button handling
-        if (b != 1 && !macroDoublePress[b]) { //don't wait for double press on buttons without a default action if no double press macro set
+      } else if (!buttonLongPressed[b]) { // short press
+        // For button 0 with no double-press macro, fire immediately (no delay)
+        if (b != 1 && !macroDoublePress[b]) {
           shortPressAction(b);
-        } else { //double press if less than 350 ms between current press and previous short press release (buttonWaitTime!=0)
+        } else {
           if (doublePress) {
             doublePressAction(b);
           } else {
