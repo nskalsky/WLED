@@ -2,21 +2,37 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <stdarg.h>
+#include <vector>
 #if defined(ARDUINO_ARCH_ESP32)
   #include <WiFi.h>
 #else
   #include <ESP8266WiFi.h>
 #endif
 
-// ---------- ring log (8KB RAM; lower if you want) ----------
+// lwIP DNS access
+extern "C" {
+  #include "lwip/dns.h"
+  #include "lwip/ip_addr.h"
+  #include "lwip/ip4_addr.h"
+}
+
+#include "skyaware_html.h"   // UI HTML (PROGMEM)
+
+// Config toggles
+#ifndef SA_FORCE_DNS_ONCE_PER_WINDOW
+  #define SA_FORCE_DNS_ONCE_PER_WINDOW 1
+#endif
+
 #ifndef SKYAWARE_LOG_CAP
   #define SKYAWARE_LOG_CAP (8 * 1024)
 #endif
+
+// -------- ring log ----------
 struct SA_RingLog {
   static const size_t CAP = SKYAWARE_LOG_CAP;
   char    buf[CAP];
-  size_t  head = 0;     // index of oldest byte
-  size_t  size = 0;     // number of bytes used
+  size_t  head = 0;
+  size_t  size = 0;
   void clear() { head = 0; size = 0; }
   void push(char c) {
     buf[(head + size) % CAP] = c;
@@ -39,7 +55,6 @@ static void SA_MEMLOGF(const char* fmt, ...) {
   SA_LOGBUF.write(tmp, (size_t)n);
 }
 
-// ---------- logging ----------
 #ifdef WLED_DEBUG
   #define SA_DBG(fmt, ...) do { \
       SA_MEMLOGF("[%9lu] [SkyAware] " fmt, millis(), ##__VA_ARGS__); \
@@ -53,17 +68,41 @@ static void SA_MEMLOGF(const char* fmt, ...) {
   #define USERMOD_ID_SKYAWARE 0x5CA7
 #endif
 
+// ===== Helpers =====
+static inline String upperTrim(String s) { s.trim(); s.toUpperCase(); return s; }
+static inline bool isAlphaNumDash(char c) {
+  return (c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_';
+}
+static inline bool timeReached(uint32_t t) { return (int32_t)(millis() - t) >= 0; }
+
+// ============================================================
+//                     SkyAware Usermod
+// ============================================================
 class SkyAwareUsermod : public Usermod {
+public:
+  enum MapMode : uint8_t { MAP_SINGLE = 0, MAP_MULTIPLE = 1 };
+  enum LedType : uint8_t { LT_SKIP = 0, LT_ICAO = 1, LT_INDICATOR = 2 };
+
+  struct LedEntry { LedType type = LT_SKIP; String value; };
+  struct SegmentMap {
+    MapMode mode = MAP_SINGLE;
+    String  wholeAirport;
+    std::vector<LedEntry> perLed;
+  };
+
 private:
-  // ---- persisted config ----
-  bool     enabled        = false; // <— stays idle until you turn this on
-  bool     autoFetchBoot  = false; // optional boot-time fetch once Wi-Fi is up
-  String   airportId      = "KPDX";
-  uint16_t updateInterval = 5;     // minutes (min 1)
+  // persisted base config
+  bool     enabled        = false;
+  bool     autoFetchBoot  = false;
+  String   airportId      = "KHIO";
+  uint16_t updateInterval = 5;     // minutes (>=1)
   static const uint32_t RETRY_DELAYS_MS[4];
   static const size_t   RETRY_COUNT = 4;
 
-  // ---- runtime state ----
+  // mapping
+  std::vector<SegmentMap> segMaps;
+
+  // runtime state
   unsigned long lastRunMs        = 0;
   bool          busy             = false;
   bool          refreshNow       = false;
@@ -82,80 +121,126 @@ private:
   uint32_t      successCount     = 0;
   uint32_t      failureCount     = 0;
 
-  // --- boot-time Wi-Fi settle logic (only if autoFetchBoot==true) ---
+  // boot settle
   bool          bootFetchPending   = false;
   bool          wasWifiConnected   = false;
   unsigned long wifiConnectedSince = 0;
-  static constexpr uint32_t BOOT_WIFI_SETTLE_MS = 5000; // wait 5s after Wi-Fi up
+  static constexpr uint32_t BOOT_WIFI_SETTLE_MS = 5000;
 
-  // ---- retry scheduler ----
-  uint32_t nextScheduledAt = 0;   // next regular tick (start of next window)
-  uint32_t windowDeadline  = 0;   // end of the retry window (== nextScheduledAt)
-  uint32_t nextAttemptAt   = 0;   // when to attempt next fetch (regular or retry)
-  size_t   retryIndex      = 0;   // which backoff step we’re on
+  // retry scheduler
+  uint32_t nextScheduledAt = 0;
+  uint32_t windowDeadline  = 0;
+  uint32_t nextAttemptAt   = 0;
+  size_t   retryIndex      = 0;
   bool     inRetryWindow   = false;
-
-  // Track interval changes without reboot
   uint32_t prevPeriodMs    = 0;
 
-  // Last known good (held to mask transient outages)
-  String   lastGoodCat     = "UNKNOWN";
-  bool     haveGoodCat     = false;
+  // per-window DNS forcing
+  bool     forcedDnsThisWindow = false;
 
-  // safe millis compare
-  static inline bool timeReached(uint32_t t) {
-    return (int32_t)(millis() - t) >= 0;
-  }
+  // per-airport cache
+  struct ApCache { String id, cat; bool good=false; unsigned long okMs=0; };
+  std::vector<ApCache> apCache;
 
-  // compute current window length in ms (follows config at runtime)
-  uint32_t periodMs() const {
-    return (uint32_t)max<uint16_t>(1, updateInterval) * 60000UL;
-  }
+  // network diag
+  struct NetDiag {
+    String host, ip, redirect;
+    int    httpCode = 0;
+    int    bytes = 0;
+    uint32_t dnsMs=0, tcpMs=0, tlsMs=0, httpMs=0;
+    String  errStage, errDetail;
+    bool    ok = false;
+    String  dnsProvider;  // "system", "dns.google", ...
+    bool    dnsFallbackUsed = false;
+    void clear(){*this = NetDiag();}
+  } lastDiag;
 
-  // (re)arm schedule to a stable cadence without drift
+  // ---------- schedule ----------
+  uint32_t periodMs() const { return (uint32_t)max<uint16_t>(1, updateInterval) * 60000UL; }
+
   void initOrRealignSchedule(bool startImmediate=false) {
     const uint32_t now = millis();
     const uint32_t period = periodMs();
-
-    // first-time init or interval changed
     if (nextScheduledAt == 0 || prevPeriodMs != period) {
       prevPeriodMs = period;
       nextScheduledAt = now + period;
     }
-    // ensure future
     while (timeReached(nextScheduledAt)) nextScheduledAt += period;
-
     windowDeadline = nextScheduledAt;
-    nextAttemptAt  = startImmediate ? now : nextScheduledAt; // manual refresh can force immediate
+    nextAttemptAt  = startImmediate ? now : nextScheduledAt;
     inRetryWindow  = false;
     retryIndex     = 0;
+    forcedDnsThisWindow = false;
   }
 
-  // Color mapping
+  // ---------- color mapping ----------
   static uint32_t colorForCategory(const String& cat) {
     if (cat.equalsIgnoreCase("VFR"))   return RGBW32(  0,255,  0,0);
     if (cat.equalsIgnoreCase("MVFR"))  return RGBW32(  0,  0,255,0);
     if (cat.equalsIgnoreCase("IFR"))   return RGBW32(255,  0,  0,0);
     if (cat.equalsIgnoreCase("LIFR"))  return RGBW32(255,  0,255,0);
-    return RGBW32(255,224,160,0); // warm-ish white for unknown/error
+    return RGBW32(255,255,255,0);
   }
 
-  static const char* colorNameForCategory(const String& cat) {
-    if (cat.equalsIgnoreCase("VFR"))   return "GREEN";
-    if (cat.equalsIgnoreCase("MVFR"))  return "BLUE";
-    if (cat.equalsIgnoreCase("IFR"))   return "RED";
-    if (cat.equalsIgnoreCase("LIFR"))  return "MAGENTA";
-    return "AMBER";
+  String getCatForAirport(const String& ap) {
+    String a = ap; a.trim(); a.toUpperCase();
+    for (auto& e : apCache) if (e.id == a) return e.good ? e.cat : String("UNKNOWN");
+    return "UNKNOWN";
+  }
+  void setCatForAirport(const String& ap, const String& cat, bool good) {
+    String a = ap; a.trim(); a.toUpperCase();
+    for (auto& e : apCache) if (e.id == a) { e.cat = cat; e.good = good && !cat.equalsIgnoreCase("UNKNOWN"); e.okMs = e.good ? millis() : 0; return; }
+    ApCache e; e.id=a; e.cat=cat; e.good=good && !cat.equalsIgnoreCase("UNKNOWN"); e.okMs = e.good ? millis() : 0; apCache.push_back(e);
   }
 
-  void applyCategoryColor(const String& cat) {
-    uint32_t c = colorForCategory(cat);
-    Segment& seg = strip.getSegment(0);
-    seg.setOption(SEG_OPTION_ON, true);
-    seg.setMode(FX_MODE_STATIC);
-    seg.setColor(0, c);
+  // Helper: paint a MULTIPLE segment using segment-local indexing.
+  void paintMultiSegment(Segment& seg, const SegmentMap& sm, const String& fallbackAp) {
+    // Freeze to stop the effect engine from repainting the buffer
+    seg.setOption(SEG_OPTION_FREEZE, true);
+
+    // Clear any stale data
+    uint16_t len = (seg.stop > seg.start) ? (seg.stop - seg.start) : 0;
+    for (uint16_t i = 0; i < len; i++) seg.setPixelColor(i, 0);
+
+    // Paint per-LED by segment-local index
+    for (uint16_t i = 0; i < len; i++) {
+      uint32_t col = 0;
+      const LedEntry& le = sm.perLed[i];
+      if (le.type == LT_ICAO) {
+        const String& ap = le.value.length() ? le.value : fallbackAp;
+        col = colorForCategory(getCatForAirport(ap));
+      }
+      seg.setPixelColor(i, col);
+    }
+    // Leave FREEZE on so we keep our pixels
+  }
+
+  void applyLayoutColors() {
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+
+    for (uint16_t si=0; si<numSegs; ++si) {
+      Segment& seg = strip.getSegment(si);
+      SegmentMap& sm = segMaps[si];
+
+      // Keep segment on; we’ll freeze in MULTIPLE
+      seg.setOption(SEG_OPTION_ON, true);
+      seg.setMode(FX_MODE_STATIC);
+
+      if (sm.mode == MAP_SINGLE) {
+        // SINGLE: unfreeze and use one color
+        seg.setOption(SEG_OPTION_FREEZE, false);
+        const String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
+        seg.setColor(0, colorForCategory(getCatForAirport(ap)));
+      } else {
+        // MULTIPLE: ensure vector length and paint via segment-local API
+        uint16_t start = seg.start, stop = seg.stop;
+        uint16_t len = (stop > start) ? (stop - start) : 0;
+        if (sm.perLed.size() != len) segMaps[si].perLed.resize(len);
+        paintMultiSegment(seg, sm, airportId);
+      }
+    }
     strip.trigger();
-    SA_DBG("applyCategoryColor: %s -> %s\n", cat.c_str(), colorNameForCategory(cat));
   }
 
   // ---------- JSON helpers ----------
@@ -167,311 +252,551 @@ private:
     }
     return "UNKNOWN";
   }
-
+  static String readStation(JsonObject o) {
+    const char* keys[] = {"icaoId","station","station_id","icao","id"};
+    for (size_t i=0;i<sizeof(keys)/sizeof(keys[0]);++i) if (o.containsKey(keys[i])) return String((const char*)o[keys[i]]);
+    return "";
+  }
   static String readMetarRaw(JsonObject o) {
     const char* keys[] = {"rawOb","raw_text","raw","metar","raw_ob","metar_text"};
-    for (size_t i=0;i<sizeof(keys)/sizeof(keys[0]);++i) {
-      if (o.containsKey(keys[i])) return String((const char*)o[keys[i]]);
-    }
+    for (size_t i=0;i<sizeof(keys)/sizeof(keys[0]);++i) if (o.containsKey(keys[i])) return String((const char*)o[keys[i]]);
     return "";
   }
 
-  static bool isAllDigits(const String& s) {
-    for (size_t i=0;i<s.length();++i) if (s[i]<'0'||s[i]>'9') return false;
-    return s.length() > 0;
+  static bool isAllDigits(const String& s){ for (size_t i=0;i<s.length();++i) if (s[i]<'0'||s[i]>'9') return false; return s.length()>0; }
+  static bool looksLikeTimeZ(const String& tok){ if(!tok.endsWith("Z")) return false; String c=tok.substring(0,tok.length()-1); return c.length()==6&&isAllDigits(c); }
+  static bool looksLikeWind(const String& tok){ if(!tok.endsWith("KT")) return false; if(tok.startsWith("VRB")) return true; if(tok.length()<7) return false; return isAllDigits(tok.substring(0,3)); }
+  static bool looksLikeVis(const String& tok){ return tok.endsWith("SM"); }
+  static bool looksLikeCloud(const String& tok){ if(tok.startsWith("VV")) return tok.length()>=4&&isAllDigits(tok.substring(2,5)); if(tok.startsWith("FEW")||tok.startsWith("SCT")||tok.startsWith("BKN")||tok.startsWith("OVC")) return true; return false; }
+  static bool looksLikeTempDew(const String& tok){
+    int s = tok.indexOf('/'); if (s<=0 || s>=(int)tok.length()-1) return false;
+    auto ok=[&](String x){ if(x.startsWith("M")) x.remove(0,1); return x.length()>=1&&x.length()<=2&&isAllDigits(x); };
+    return ok(tok.substring(0,s)) && ok(tok.substring(s+1));
+  }
+  static bool looksLikeAltim(const String& tok){ if(tok.startsWith("A")&&tok.length()==5&&isAllDigits(tok.substring(1))) return true; if(tok.startsWith("Q")&&tok.length()==5&&isAllDigits(tok.substring(1))) return true; return false; }
+  static bool looksLikeStation(const String& tok){ if(tok.length()<4||tok.length()>5) return false; for(size_t i=0;i<tok.length();++i){char c=tok[i]; if(c<'A'||c>'Z') return false;} return true; }
+  static bool looksLikeWx(const String& tok){
+    const char* wx[] = {"RA","DZ","SN","SG","PL","GR","GS","IC","UP","BR","FG","FU","VA","DU","SA","HZ","PY","TS","SH","FZ","PO","SQ","FC","SS","DS"};
+    String t=tok; t.replace("+",""); t.replace("-",""); t.replace("VC","");
+    for(size_t i=0;i<sizeof(wx)/sizeof(wx[0]);++i) if (t.indexOf(wx[i])!=-1) return true; return false;
+  }
+  void parseMetarIntoFields(const String& metar){
+    metarStation=metarTimeZ=metarWind=metarVis=metarClouds=metarTempDew=metarAltim=metarWx=metarRemarks="";
+    if (!metar.length()) return;
+    const int MAXT=80; String toks[MAXT]; int nt=0;
+    for (int i=0,n=metar.length(); i<n && nt<MAXT;){
+      while(i<n && metar[i]==' ') i++; int j=i; while(j<n && metar[j]!=' ') j++;
+      if (j>i) toks[nt++]=metar.substring(i,j); i=j+1;
+    }
+    int idxRMK=-1; for(int k=0;k<nt;k++) if(toks[k]=="RMK"){ idxRMK=k; break; }
+    for (int k=0;k<nt;k++){
+      const String& t=toks[k];
+      if (t=="METAR"||t=="SPECI"||t=="AUTO"||t=="=") continue;
+      if (metarStation==""&&looksLikeStation(t)){metarStation=t;continue;}
+      if (metarTimeZ==""&&looksLikeTimeZ(t))   {metarTimeZ=t;continue;}
+      if (metarWind==""&&looksLikeWind(t))     {metarWind=t;continue;}
+      if (metarVis==""&&looksLikeVis(t)){ if(k>0&&isAllDigits(toks[k-1])) metarVis=toks[k-1]+" "+t; else metarVis=t; continue; }
+      if (looksLikeCloud(t)){ if(metarClouds.length()) metarClouds+=' '; metarClouds+=t; continue; }
+      if (metarTempDew==""&&looksLikeTempDew(t)){metarTempDew=t;continue;}
+      if (metarAltim==""&&looksLikeAltim(t))  {metarAltim=t;continue;}
+      if (looksLikeWx(t)){ if(metarWx.length()) metarWx+=' '; metarWx+=t; continue; }
+    }
+    if (idxRMK>=0 && idxRMK<nt-1){ String r; for(int k=idxRMK+1;k<nt;k++){ if(r.length()) r+=' '; r+=toks[k]; } metarRemarks=r; }
   }
 
-  static bool looksLikeTimeZ(const String& tok) {
-    // e.g. 191753Z : 6 digits + 'Z'
-    if (!tok.endsWith("Z")) return false;
-    String core = tok.substring(0, tok.length()-1);
-    return core.length()==6 && isAllDigits(core);
+  static String httpcErrName(int code) {
+    if (code >= 0) return String(code);
+    switch(code){
+      case -1:  return "HTTPC_ERROR_CONNECTION_REFUSED(-1)";
+      case -2:  return "HTTPC_ERROR_SEND_HEADER_FAILED(-2)";
+      case -3:  return "HTTPC_ERROR_SEND_PAYLOAD_FAILED(-3)";
+      case -4:  return "HTTPC_ERROR_NOT_CONNECTED(-4)";
+      case -5:  return "HTTPC_ERROR_CONNECTION_LOST(-5)";
+      case -6:  return "HTTPC_ERROR_NO_STREAM(-6)";
+      case -7:  return "HTTPC_ERROR_NO_HTTP_SERVER(-7)";
+      case -8:  return "HTTPC_ERROR_TOO_LESS_RAM(-8)";
+      case -9:  return "HTTPC_ERROR_ENCODING(-9)";
+      case -10: return "HTTPC_ERROR_STREAM_WRITE(-10)";
+      case -11: return "HTTPC_ERROR_READ_TIMEOUT(-11)";
+      default:  return String("HTTPClient_ERR(")+code+")";
+    }
   }
 
-  static bool looksLikeWind(const String& tok) {
-    // 00000KT, 20012G20KT, VRB03KT, 12012KT
-    if (!tok.endsWith("KT")) return false;
-    if (tok.startsWith("VRB")) return true;
-    if (tok.length() < 7) return false; // e.g. dddffKT minimal length
-    String d = tok.substring(0,3);
-    return isAllDigits(d);
-  }
-
-  static bool looksLikeVis(const String& tok) {
-    // 10SM, 3/4SM, 1 1/2SM (will capture the first part 1 or 1 1/2 later)
-    return tok.endsWith("SM");
-  }
-
-  static bool looksLikeCloud(const String& tok) {
-    // FEW/SCT/BKN/OVCxxx, VVxxx
-    if (tok.startsWith("VV"))  return tok.length()>=4 && isAllDigits(tok.substring(2,5));
-    if (tok.startsWith("FEW") || tok.startsWith("SCT") || tok.startsWith("BKN") || tok.startsWith("OVC")) return true;
+  // ===== DOH helpers =====
+  bool dohResolveOnce_IP(const String& host, IPAddress& out, String& provider, uint32_t& tookMs,
+                         const char* providerHost, const char* providerIP, const char* pathPrefix,
+                         const char* provName)
+  {
+    IPAddress dohIP; if (!dohIP.fromString(providerIP)) return false;
+    WiFiClientSecure cli; cli.setInsecure();
+  #if defined(ARDUINO_ARCH_ESP32)
+    cli.setHandshakeTimeout(8);
+  #endif
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setReuse(false);
+    String path = String(pathPrefix) + host;
+    uint32_t t0 = millis();
+    if (!http.begin(cli, dohIP.toString(), 443, path, true)) { http.end(); return false; }
+    http.addHeader("Host", providerHost, true, false);
+    http.addHeader("Accept", "application/dns-json");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { http.end(); return false; }
+    DynamicJsonDocument d(1536);
+    DeserializationError jerr = deserializeJson(d, http.getStream());
+    http.end();
+    tookMs = millis() - t0;
+    if (jerr) return false;
+    JsonArray ans = d["Answer"].as<JsonArray>();
+    if (ans.isNull() || ans.size()==0) return false;
+    for (JsonVariant v : ans) {
+      JsonObject o = v.as<JsonObject>();
+      if (o.isNull()) continue;
+      int t = o["type"] | 0;
+      String data = o["data"] | "";
+      if (t == 1 && out.fromString(data)) { provider = provName; return true; }
+    }
+    for (JsonVariant v : ans) {
+      String data = v["data"] | "";
+      if (out.fromString(data)) { provider = provName; return true; }
+    }
     return false;
   }
 
-  static bool looksLikeTempDew(const String& tok) {
-    // M05/M10, 18/12, 03/M01
-    int slash = tok.indexOf('/');
-    if (slash <= 0 || slash >= (int)tok.length()-1) return false;
-    // tolerate 'M' prefix
-    auto okHalf = [](const String& x){
-      String y=x;
-      if (y.startsWith("M")) y.remove(0,1);
-      return y.length()>=1 && y.length()<=2 && isAllDigits(y);
-    };
-    return okHalf(tok.substring(0,slash)) && okHalf(tok.substring(slash+1));
+  bool resolveHostWithFallback(const String& host, IPAddress& ipOut, String& providerOut, uint32_t& dnsMsOut) {
+    uint32_t t0 = millis();
+    if (WiFi.hostByName(host.c_str(), ipOut) == 1) { dnsMsOut = millis() - t0; providerOut="system"; lastDiag.dnsFallbackUsed=false; return true; }
+    if (dohResolveOnce_IP(host, ipOut, providerOut, dnsMsOut, "dns.google", "8.8.8.8", "/resolve?type=A&name=", "dns.google")) { lastDiag.dnsFallbackUsed=true; return true; }
+    if (dohResolveOnce_IP(host, ipOut, providerOut, dnsMsOut, "cloudflare-dns.com", "1.1.1.1", "/dns-query?type=A&name=", "cloudflare-dns")) { lastDiag.dnsFallbackUsed=true; return true; }
+    if (dohResolveOnce_IP(host, ipOut, providerOut, dnsMsOut, "dns.quad9.net", "9.9.9.9", "/dns-query?type=A&name=", "quad9")) { lastDiag.dnsFallbackUsed=true; return true; }
+    dnsMsOut = millis() - t0; return false;
   }
 
-  static bool looksLikeAltim(const String& tok) {
-    // A2992, Q1013
-    if (tok.startsWith("A") && tok.length()==5 && isAllDigits(tok.substring(1))) return true;
-    if (tok.startsWith("Q") && tok.length()==5 && isAllDigits(tok.substring(1))) return true;
-    return false;
-  }
-
-  static bool looksLikeStation(const String& tok) {
-    if (tok.length()<4 || tok.length()>5) return false;
-    for (size_t i=0;i<tok.length();++i) {
-      char c=tok[i];
-      if (c<'A'||c>'Z') return false;
-    }
-    return true;
-  }
-
-  static bool looksLikeWx(const String& tok) {
-    // Common weather codes (not exhaustive but useful)
-    const char* wx[] = {"RA","DZ","SN","SG","PL","GR","GS","IC","UP",
-                        "BR","FG","FU","VA","DU","SA","HZ","PY",
-                        "TS","SH","FZ","PO","SQ","FC","SS","DS"};
-    String t = tok; t.replace("+",""); t.replace("-",""); t.replace("VC","");
-    // e.g. "-RA", "SHRA", "TSRA", "FZRASN"
-    for (size_t i=0;i<sizeof(wx)/sizeof(wx[0]);++i) {
-      if (t.indexOf(wx[i])!=-1) return true;
-    }
-    return false;
-  }
-
-  void parseMetarIntoFields(const String& metar) {
-    metarStation = metarTimeZ = metarWind = metarVis = metarClouds = metarTempDew = metarAltim = metarWx = metarRemarks = "";
-    if (metar.length()==0) return;
-
-    // Split by spaces (no std::vector needed)
-    const int MAXT = 80;
-    String toks[MAXT];
-    int nt = 0;
-    int i = 0, n = metar.length();
-    while (i < n && nt < MAXT) {
-      while (i < n && metar[i] == ' ') i++;
-      int j = i;
-      while (j < n && metar[j] != ' ') j++;
-      if (j > i) toks[nt++] = metar.substring(i, j);
-      i = j + 1;
-    }
-
-    // Find remarks start, if present
-    int idxRMK = -1;
-    for (int k = 0; k < nt; k++) {
-      if (toks[k] == "RMK") { idxRMK = k; break; }
-    }
-
-    // Extract key fields
-    for (int k = 0; k < nt; k++) {
-      const String& t = toks[k];
-
-      // Skip common non-station leading tokens
-      if (t == "METAR" || t == "SPECI" || t == "AUTO" || t == "=") continue;
-
-      if (metarStation == "" && looksLikeStation(t)) { metarStation = t; continue; }
-      if (metarTimeZ  == "" && looksLikeTimeZ(t))    { metarTimeZ  = t; continue; }
-      if (metarWind   == "" && looksLikeWind(t))     { metarWind   = t; continue; }
-
-      if (metarVis == "" && looksLikeVis(t)) {
-        // Handle “1 1/2SM” pattern (stitch with previous numeric token)
-        if (k > 0 && isAllDigits(toks[k-1])) metarVis = toks[k-1] + " " + t;
-        else metarVis = t;
-        continue;
-      }
-
-      if (looksLikeCloud(t)) {
-        if (metarClouds.length()) metarClouds += " ";
-        metarClouds += t;
-        continue;
-      }
-
-      if (metarTempDew == "" && looksLikeTempDew(t)) { metarTempDew = t; continue; }
-      if (metarAltim   == "" && looksLikeAltim(t))   { metarAltim   = t; continue; }
-
-      if (looksLikeWx(t)) {
-        if (metarWx.length()) metarWx += " ";
-        metarWx += t;
-        continue;
-      }
-    }
-
-    // Stitch remarks
-    if (idxRMK >= 0 && idxRMK < nt - 1) {
-      String r;
-      for (int k = idxRMK + 1; k < nt; k++) {
-        if (r.length()) r += ' ';
-        r += toks[k];
-      }
-      metarRemarks = r;
-    }
-  }
-
-  bool fetchMetarOnce() {
-    if (!WLED_CONNECTED) {
-      lastErr = "WiFi not connected";
-      SA_DBG("%s\n", lastErr.c_str());
-      return false;
-    }
-
-    lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + airportId;
+  bool fetchJsonWithDiag(const String& url, DynamicJsonDocument& doc, bool wantPreview=true) {
+    lastDiag.clear();
+    lastUrl = url;
     lastErr = ""; lastHttp = 0; lastBodyPreview = "";
     lastFetchStartMs = millis();
-    SA_DBG("fetch: %s\n", lastUrl.c_str());
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    const String scheme = "https://";
+    if (!url.startsWith(scheme)) { lastErr = "URL must be https://"; return false; }
+    int p = url.indexOf('/', scheme.length());
+    const String hostPort = (p>0) ? url.substring(scheme.length(), p) : url.substring(scheme.length());
+    const String path     = (p>0) ? url.substring(p) : "/";
+    String host = hostPort; int port = 443;
+    int c = hostPort.indexOf(':');
+    if (c>0) { host = hostPort.substring(0, c); port = hostPort.substring(c+1).toInt(); if (port <= 0) port = 443; }
+    lastDiag.host = host;
+
+    IPAddress ip; uint32_t dnsT = 0; String provider;
+    if (!resolveHostWithFallback(host, ip, provider, dnsT)) {
+      lastDiag.errStage = "dns"; lastDiag.errDetail = "DNS failed (system+DoH)";
+      lastDiag.dnsMs = dnsT; SA_DBG("DNS failed for %s (system+DoH)\n", host.c_str());
+      return false;
+    }
+    lastDiag.ip = ip.toString();
+    lastDiag.dnsMs = dnsT;
+    lastDiag.dnsProvider = provider;
+
+#if SA_FORCE_DNS_ONCE_PER_WINDOW
+    if (lastDiag.dnsFallbackUsed && !forcedDnsThisWindow) {
+#else
+    if (lastDiag.dnsFallbackUsed) {
+#endif
+      ip_addr_t d1, d2;
+      ipaddr_aton("1.1.1.1", &d1);
+      ipaddr_aton("8.8.8.8", &d2);
+      dns_setserver(0, &d1);
+      dns_setserver(1, &d2);
+      forcedDnsThisWindow = true;
+      SA_DBG("DNS: forced to 1.1.1.1 / 8.8.8.8 (once/window)\n");
+    }
+
+    { // TCP probe
+      WiFiClient tcp; uint32_t t0=millis();
+      bool ok = tcp.connect(ip, port, 4000);
+      lastDiag.tcpMs = millis()-t0;
+      if (!ok) { lastDiag.errStage="tcp"; lastDiag.errDetail="TCP connect failed"; return false; }
+      tcp.stop();
+    }
+    { // TLS probe with SNI
+      WiFiClientSecure tls; tls.setInsecure();
+    #if defined(ARDUINO_ARCH_ESP32)
+      tls.setHandshakeTimeout(10);
+    #endif
+      uint32_t t0=millis();
+      bool ok=tls.connect(host.c_str(), port);
+      lastDiag.tlsMs = millis()-t0;
+      if(!ok){ lastDiag.errStage="tls"; lastDiag.errDetail="TLS handshake failed"; return false; }
+      tls.stop();
+    }
+
+    WiFiClientSecure client; client.setInsecure();
+  #if defined(ARDUINO_ARCH_ESP32)
+    client.setHandshakeTimeout(10);
+  #endif
     HTTPClient http;
-    http.setUserAgent("WLED-SkyAware/0.1 (+esp)");
+    http.setUserAgent("WLED-SkyAware/0.6 (+esp)");
     http.setConnectTimeout(8000);
     http.setReuse(false);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    const char* hdrs[] = {"Location","Content-Type","Content-Length","Server"};
+    http.collectHeaders(hdrs, 4);
 
-    if (!http.begin(client, lastUrl)) {
-      lastErr = "http.begin() failed";
-      SA_DBG("%s\n", lastErr.c_str());
+    uint32_t t0 = millis();
+    if (!http.begin(client, url)) {
+      lastDiag.errStage="http"; lastDiag.errDetail="http.begin failed (hostname)";
+      lastDiag.httpMs = millis() - t0;
       return false;
     }
 
     int code = http.GET();
     lastHttp = code;
-    SA_DBG("HTTP %d\n", code);
+    lastDiag.httpCode = code;
+    lastDiag.httpMs = millis() - t0;
+
+    if (http.hasHeader("Location")) lastDiag.redirect = http.header("Location");
 
     if (code != HTTP_CODE_OK) {
-      lastErr = String("HTTP ") + code;
+      lastErr = httpcErrName(code);
+      String prev; int limit = 128;
+      WiFiClient& es = http.getStream();
+      while (es.connected() && es.available() && (limit--)>0) prev += (char)es.read();
+      lastBodyPreview = prev;
+      lastDiag.bytes = prev.length();
       http.end();
-      lastFetchDurMs = millis() - lastFetchStartMs;
       failureCount++;
-      SA_DBG("fail: %s (dur=%lums)\n", lastErr.c_str(), lastFetchDurMs);
+      lastFetchDurMs = millis() - lastFetchStartMs;
       return false;
     }
 
-    // stream parse to avoid big stack/String copies
-    WiFiClient& stream = http.getStream();
-    DynamicJsonDocument doc(2048); // single-station METAR JSON
-    DeserializationError err = deserializeJson(doc, stream);
-    http.end(); // close network before we do more work
-
-    if (err) {
-      lastErr = String("JSON: ") + err.c_str();
-      lastFetchDurMs = millis() - lastFetchStartMs;
-      failureCount++;
-      SA_DBG("parse error: %s (dur=%lums)\n", lastErr.c_str(), lastFetchDurMs);
-      return false;
+    { // parse JSON
+      WiFiClient& stream = http.getStream();
+      if (!wantPreview) lastBodyPreview = "";
+      DeserializationError jerr = deserializeJson(doc, stream);
+      http.end();
+      if (jerr) {
+        lastDiag.errStage="json"; lastDiag.errDetail = String("ArduinoJson: ") + jerr.c_str();
+        failureCount++; lastFetchDurMs = millis() - lastFetchStartMs; lastErr = lastDiag.errDetail;
+        return false;
+      }
+      lastDiag.bytes = http.getSize();
     }
 
-    if (!doc.is<JsonArray>()) {
-      lastErr = "JSON not array";
-      lastFetchDurMs = millis() - lastFetchStartMs;
-      failureCount++;
-      SA_DBG("%s (dur=%lums)\n", lastErr.c_str(), lastFetchDurMs);
-      return false;
-    }
-
-    JsonArray arr = doc.as<JsonArray>();
-    if (arr.isNull() || arr.size() == 0) {
-      lastErr = "empty array";
-      lastFetchDurMs = millis() - lastFetchStartMs;
-      failureCount++;
-      SA_DBG("%s (dur=%lums)\n", lastErr.c_str(), lastFetchDurMs);
-      return false;
-    }
-
-    JsonObject first = arr[0].as<JsonObject>();
-    if (first.isNull()) {
-      lastErr = "first element not object";
-      lastFetchDurMs = millis() - lastFetchStartMs;
-      failureCount++;
-      SA_DBG("%s (dur=%lums)\n", lastErr.c_str(), lastFetchDurMs);
-      return false;
-    }
-
-#ifdef WLED_DEBUG
-    { String firstStr; serializeJson(first, firstStr);
-      SA_DBG("first METAR json: %s\n", firstStr.c_str()); }
-#endif
-
-    String cat = readFlightCategory(first);
-    SA_DBG("flight_category=%s\n", cat.c_str());
-
-    lastCat = cat;
-    applyCategoryColor(cat);             // show the *good* result now
-
-    // Record last-known-good (for outage masking)
-    lastGoodCat = cat;
-    haveGoodCat = !cat.equalsIgnoreCase("UNKNOWN");
-
-    lastOkMs = millis();
-    lastFetchDurMs = lastOkMs - lastFetchStartMs;
-    successCount++;
-
-#if defined(ARDUINO_ARCH_ESP32)
-    SA_DBG("ok: dur=%lums, success=%lu, failure=%lu, heap=%lu\n",
-           lastFetchDurMs, (unsigned long)successCount, (unsigned long)failureCount,
-           (unsigned long)ESP.getFreeHeap());
-#else
-    SA_DBG("ok: dur=%lums, success=%lu, failure=%lu\n",
-           lastFetchDurMs, (unsigned long)successCount, (unsigned long)failureCount);
-#endif
-
-    lastMetarRaw = readMetarRaw(first);
-    parseMetarIntoFields(lastMetarRaw);
-
+    lastDiag.ok = true;
+    lastFetchDurMs = millis() - lastFetchStartMs;
     return true;
   }
 
-  // ---- immediate fetch trigger (NEW) ----
-  void triggerImmediateFetch(const char* why) {
-    SA_DBG("immediate fetch queued (%s)\n", why ? why : "n/a");
-    refreshNow = true;            // loop() consumes this
-    initOrRealignSchedule(true);  // nextAttemptAt = now, cadence preserved
+  // ===== METAR fetchers =====
+  bool fetchMetarOnce() {
+    if (!WLED_CONNECTED) { lastErr="WiFi not connected"; return false; }
+    String primary = getPrimaryAirportForSingle();
+    lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + primary;
+    DynamicJsonDocument doc(2048);
+    bool ok = fetchJsonWithDiag(lastUrl, doc, true);
+    lastHttp = lastDiag.httpCode;
+    if (!ok) { failureCount++; return false; }
+    if (!doc.is<JsonArray>()) { lastErr="JSON not array"; failureCount++; return false; }
+    JsonArray arr = doc.as<JsonArray>();
+    if (arr.isNull() || arr.size()==0) { lastErr="empty array"; failureCount++; return false; }
+    JsonObject first = arr[0].as<JsonObject>(); if (first.isNull()) { lastErr="first not object"; failureCount++; return false; }
+
+    String stn = readStation(first);
+    String cat = readFlightCategory(first);
+    if (stn.length()) {
+      lastCat = cat;
+      setCatForAirport(stn, cat, true);
+      lastMetarRaw = readMetarRaw(first);
+      parseMetarIntoFields(lastMetarRaw);
+      lastOkMs = millis();
+    }
+    successCount++;
+    return true;
+  }
+
+  bool fetchMetarMulti(const std::vector<String>& airports) {
+    if (!WLED_CONNECTED) { lastErr="WiFi not connected"; return false; }
+    if (airports.empty()) return true;
+
+    String ids;
+    for (size_t i=0;i<airports.size();++i) { if (i) ids+=','; ids += airports[i]; }
+
+    lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + ids;
+    DynamicJsonDocument doc(4096);
+    bool ok = fetchJsonWithDiag(lastUrl, doc, true);
+    lastHttp = lastDiag.httpCode;
+    if (!ok) { failureCount++; return false; }
+    if (!doc.is<JsonArray>()) { lastErr="JSON not array"; failureCount++; return false; }
+    JsonArray arr = doc.as<JsonArray>();
+    if (arr.isNull()) { lastErr="null array"; failureCount++; return false; }
+
+    bool anyOk=false;
+    for (JsonVariant v : arr) {
+      JsonObject o = v.as<JsonObject>();
+      if (o.isNull()) continue;
+      String stn = readStation(o);
+      String cat = readFlightCategory(o);
+      if (stn.length()) {
+        setCatForAirport(stn, cat, true);
+        anyOk = true;
+      }
+    }
+    if (anyOk) {
+      String prim = airports[0];
+      lastCat = getCatForAirport(prim);
+      lastMetarRaw = ""; metarStation=metarTimeZ=metarWind=metarVis=metarClouds=metarTempDew=metarAltim=metarWx=metarRemarks="";
+      lastOkMs = millis();
+    } else { lastErr="no stations parsed"; failureCount++; return false; }
+    successCount++;
+    return true;
+  }
+
+  // ===== mapping helpers =====
+  void gatherAllAirports(std::vector<String>& out) {
+    out.clear();
+    auto pushUnique=[&](const String& s){
+      if (!s.length()) return;
+      String a = upperTrim(s);
+      if (a=="SKIP"||a=="-") return;
+      for (auto& t : out) if (t==a) return;
+      out.push_back(a);
+    };
+
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+
+    bool anySingle = false;
+    bool anyMultiple = false;
+
+    for (uint16_t si=0; si<numSegs; ++si) {
+      SegmentMap& sm = segMaps[si];
+      if (sm.mode == MAP_SINGLE) {
+        anySingle = true;
+        String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
+        pushUnique(ap);
+      } else {
+        anyMultiple = true;
+        Segment& seg = strip.getSegment(si);
+        uint16_t len = (seg.stop>seg.start)?(seg.stop-seg.start):0;
+        if (sm.perLed.size()!=len) sm.perLed.resize(len);
+        for (auto& le : sm.perLed) if (le.type==LT_ICAO) pushUnique(le.value);
+      }
+    }
+
+    if (!anySingle && !anyMultiple && airportId.length()) pushUnique(airportId);
+  }
+
+  String getPrimaryAirportForSingle() {
+    // first SINGLE segment’s airport or global fallback
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+    for (uint16_t si=0; si<numSegs; ++si) {
+      if (segMaps[si].mode == MAP_SINGLE) {
+        String ap = segMaps[si].wholeAirport.length()? segMaps[si].wholeAirport : airportId;
+        if (ap.length()) return upperTrim(ap);
+      }
+    }
+    return upperTrim(airportId);
+  }
+
+  static const char* modeLabel(MapMode m) { return (m==MAP_SINGLE) ? "SINGLE" : "MULTIPLE"; }
+
+  void writeMappingsJson(JsonArray& arr) {
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+    for (uint16_t si=0; si<numSegs; ++si) {
+      JsonObject s = arr.createNestedObject();
+      s["segment"] = si;
+      s["mode"] = modeLabel(segMaps[si].mode);
+      if (segMaps[si].mode == MAP_SINGLE) {
+        s["airport"] = segMaps[si].wholeAirport;
+      } else {
+        JsonArray leds = s.createNestedArray("leds");
+        for (auto& le : segMaps[si].perLed) {
+          JsonObject o = leds.createNestedObject();
+          o["t"] = (le.type==LT_SKIP ? "SKIP" : (le.type==LT_ICAO ? "ICAO" : "INDICATOR"));
+          o["v"] = le.value;
+        }
+      }
+    }
+  }
+
+  void writeSegmentsJson(Print& out) {
+    StaticJsonDocument<4096> d;
+    JsonArray arr = d.createNestedArray("segments");
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+
+    for (uint16_t si=0; si<numSegs; ++si) {
+      Segment& seg = strip.getSegment(si);
+      uint16_t start = seg.start, stop = seg.stop, len = (stop>start)?(stop-start):0;
+
+      JsonObject s = arr.createNestedObject();
+      s["index"]  = si;
+      s["start"]  = start;
+      s["stop"]   = stop;
+      s["length"] = len;
+
+      JsonObject m = s.createNestedObject("map");
+      SegmentMap& sm = segMaps[si];
+      m["mode"] = modeLabel(sm.mode);
+
+      if (sm.mode == MAP_SINGLE) {
+        String ap = sm.wholeAirport.length()? sm.wholeAirport : airportId;
+        m["airport"] = ap;
+      } else {
+        if (sm.perLed.size()!=len) sm.perLed.resize(len);
+        JsonArray leds = m.createNestedArray("leds");
+        for (uint16_t i=0;i<len;i++) {
+          const LedEntry& le = sm.perLed[i];
+          if (le.type==LT_SKIP) leds.add("-");
+          else if (le.type==LT_ICAO) leds.add(le.value);
+          else { String v="IND:"; v+=le.value; leds.add(v); }
+        }
+      }
+    }
+    serializeJson(d, out);
+  }
+
+  void writeAirportsJson(JsonArray& arr) {
+    for (auto& e : apCache) {
+      JsonObject a = arr.createNestedObject();
+      a["id"]  = e.id;
+      a["cat"] = e.cat;
+      a["good"]= e.good;
+      a["okSec"] = (int)(e.okMs/1000);
+    }
+  }
+
+  void writeDiagJson(JsonObject& d) {
+    d["host"] = lastDiag.host;
+    d["ip"]   = lastDiag.ip;
+    d["http"] = lastDiag.httpCode;
+    d["redirect"] = lastDiag.redirect;
+    d["dnsMs"]  = (int)lastDiag.dnsMs;
+    d["tcpMs"]  = (int)lastDiag.tcpMs;
+    d["tlsMs"]  = (int)lastDiag.tlsMs;
+    d["httpMs"] = (int)lastDiag.httpMs;
+    d["bytes"]  = lastDiag.bytes;
+    d["ok"]     = lastDiag.ok;
+    d["stage"]  = lastDiag.errStage;
+    d["detail"] = lastDiag.errDetail;
+    d["dnsProvider"] = lastDiag.dnsProvider;
+    d["dnsFallback"] = lastDiag.dnsFallbackUsed;
   }
 
   void writeStateJson(Print& out) {
-    StaticJsonDocument<2048> d;
+    StaticJsonDocument<4096> d;
     JsonObject s = d.createNestedObject("SkyAware");
-    s["enabled"]    = enabled;
-    s["autoBoot"]   = autoFetchBoot;
-    s["airport"]    = airportId;
-    s["category"]   = lastCat;
-    s["interval"]   = updateInterval;
-    s["http"]       = lastHttp;
-    s["err"]        = lastErr;
-    s["url"]        = lastUrl;
-    s["bodyPrev"]   = lastBodyPreview;
-    s["lastOkSec"]  = (int)(lastOkMs/1000);
-    s["fetchMs"]    = (int)lastFetchDurMs;
-    s["ok"]         = successCount;
-    s["fail"]       = failureCount;
-    s["bootWaitMs"] = (int)BOOT_WIFI_SETTLE_MS;
-    s["pendingFetch"] = (bool)refreshNow; // <— NEW: reflect queued fetch
+    s["enabled"]      = enabled;
+    s["autoBoot"]     = autoFetchBoot;
+    s["airport"]      = airportId;
+    s["category"]     = lastCat;
+    s["interval"]     = updateInterval;
+    s["http"]         = lastHttp;
+    s["err"]          = lastErr;
+    s["url"]          = lastUrl;
+    s["bodyPrev"]     = lastBodyPreview;
+    s["lastOkSec"]    = (int)(lastOkMs/1000);
+    s["fetchMs"]      = (int)lastFetchDurMs;
+    s["ok"]           = successCount;
+    s["fail"]         = failureCount;
+    s["bootWaitMs"]   = (int)BOOT_WIFI_SETTLE_MS;
+    s["pendingFetch"] = (bool)refreshNow;
 
-    // METAR details
+    // NEW: scheduler fields for countdown
+    s["nowSec"]        = (int)(millis()/1000);
+    s["nextAttemptSec"]= (int)(nextAttemptAt/1000);
+    s["windowEndSec"]  = (int)(windowDeadline/1000);
+    s["periodSec"]     = (int)(periodMs()/1000);
+    s["retryIndex"]    = (int)retryIndex;
+    s["inRetryWindow"] = (bool)inRetryWindow;
+
+    // Mode summary + primary
+    bool anySingle=false, anyMultiple=false;
+    {
+      uint16_t numSegs = strip.getSegmentsNum();
+      if (segMaps.size() < numSegs) const_cast<SkyAwareUsermod*>(this)->syncSegMapSize();
+      for (uint16_t si=0; si<numSegs; ++si) ((segMaps[si].mode==MAP_SINGLE)? anySingle: anyMultiple)=true;
+    }
+    const char* modeSumm = anyMultiple ? "MULTIPLE" : "SINGLE";
+    s["mode"] = modeSumm;
+    s["primary"] = anyMultiple ? "" : getPrimaryAirportForSingle();
+
+    // wanted airports per mapping
+    {
+      std::vector<String> aps; gatherAllAirports(aps);
+      JsonArray want = s.createNestedArray("wanted");
+      for (auto& id: aps) want.add(id);
+    }
+
+    // WiFi quick info (for UI convenience)
+    s["ssid"]  = WiFi.SSID();
+    s["rssi"]  = WiFi.RSSI();
+    s["staIP"] = WiFi.localIP().toString();
+
+    // METAR (single-primary oriented; MULTIPLE view ignores details)
     s["metarRaw"] = lastMetarRaw;
     JsonObject mp = s.createNestedObject("metar");
-    mp["station"] = metarStation;
-    mp["timeZ"]   = metarTimeZ;
-    mp["wind"]    = metarWind;
-    mp["vis"]     = metarVis;
-    mp["clouds"]  = metarClouds;
-    mp["tempDew"] = metarTempDew;
-    mp["altim"]   = metarAltim;
-    mp["wx"]      = metarWx;
-    mp["remarks"] = metarRemarks;
+    mp["station"] = metarStation; mp["timeZ"] = metarTimeZ; mp["wind"] = metarWind;
+    mp["vis"] = metarVis; mp["clouds"]=metarClouds; mp["tempDew"]=metarTempDew;
+    mp["altim"]=metarAltim; mp["wx"]=metarWx; mp["remarks"]=metarRemarks;
+
+    // mappings + cached airports + diag
+    JsonArray mj = s.createNestedArray("mappings"); writeMappingsJson(mj);
+    JsonArray aj = s.createNestedArray("airports"); writeAirportsJson(aj);
+    JsonObject nd = s.createNestedObject("net"); writeDiagJson(nd);
 
     serializeJson(d, out);
+  }
+
+  void syncSegMapSize() {
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() == numSegs) return;
+    size_t old = segMaps.size();
+    segMaps.resize(numSegs);
+    for (size_t i=old; i<segMaps.size(); ++i) {
+      segMaps[i].mode = MAP_SINGLE;
+      segMaps[i].wholeAirport = airportId;
+      segMaps[i].perLed.clear();
+    }
+  }
+
+  void parseLedCsv(uint16_t segIndex, const String& csv) {
+    syncSegMapSize();
+    Segment& seg = strip.getSegment(segIndex);
+    uint16_t len = (seg.stop>seg.start)?(seg.stop-seg.start):0;
+
+    segMaps[segIndex].mode = MAP_MULTIPLE;
+    segMaps[segIndex].perLed.clear();
+    segMaps[segIndex].perLed.resize(len);
+
+    uint16_t idx = 0;
+    for (int i=0,n=csv.length(); i<n && idx<len;){
+      int j=i; while(j<n && csv[j]!=',') j++;
+      String tok = csv.substring(i,j); tok.trim();
+      LedEntry le;
+      if (tok.length()==0 || tok=="-" || tok.equalsIgnoreCase("SKIP")) {
+        le.type = LT_SKIP;
+      } else if (tok.startsWith("IND:")) {
+        le.type = LT_INDICATOR; le.value = tok.substring(4);
+      } else {
+        String ap = upperTrim(tok);
+        bool ok=true;
+        if (ap.length()<3 || ap.length()>8) ok=false;
+        for (size_t k=0; k<ap.length() && ok; ++k) ok = isAlphaNumDash(ap[k]);
+        if (ok) { le.type = LT_ICAO; le.value = ap; } else { le.type = LT_SKIP; }
+      }
+      segMaps[segIndex].perLed[idx++] = le;
+      i = (j<n)? (j+1) : j;
+    }
+  }
+
+  void triggerImmediateFetch(const char* why) {
+    SA_DBG("immediate fetch queued (%s)\n", why ? why : "n/a");
+    refreshNow = true;
+    initOrRealignSchedule(true);
   }
 
 public:
@@ -480,370 +805,200 @@ public:
     SA_DBG("setup: airport=%s, interval=%u min, enabled=%d, autoFetch=%d\n",
            airportId.c_str(), updateInterval, (int)enabled, (int)autoFetchBoot);
 
-    extern AsyncWebServer server;  // WLED global server object
+    for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(255,255,255,0));
+    strip.trigger();
 
-    // Enable/disable at runtime (doesn't persist)
-    server.on("/um/skyaware/enable", HTTP_GET, [this](AsyncWebServerRequest* r){
+    extern AsyncWebServer server;
+
+    // ===== UI =====
+    server.on("/skyaware", HTTP_GET, [](AsyncWebServerRequest* r){
+      size_t htmlLen = strlen_P((PGM_P)SKY_UI_HTML);
+      AsyncWebServerResponse* res = r->beginResponse_P(
+        200, F("text/html"),
+        reinterpret_cast<const uint8_t*>(SKY_UI_HTML),
+        htmlLen
+      );
+      r->send(res);
+    });
+
+    // ===== API (logical under /api/skyaware/* ) =====
+    server.on("/api/skyaware/enable", HTTP_GET, [this](AsyncWebServerRequest* r){
       bool on = r->hasParam("on") && (r->getParam("on")->value() == "1");
-      enabled = on;
-      SA_DBG("runtime enable=%d\n", (int)enabled);
-      r->send(200, "text/plain", enabled ? "SkyAware: enabled" : "SkyAware: disabled");
+      enabled = on; r->send(200, "text/plain", enabled ? "SkyAware: enabled" : "SkyAware: disabled");
     });
 
-    // Simple numeric endpoint: returns successful METAR fetches since boot
-    server.on("/um/skyaware/okcount", HTTP_GET, [this](AsyncWebServerRequest* r){
-      r->send(200, "text/plain", String(successCount));
+    server.on("/api/skyaware/refresh", HTTP_GET, [this](AsyncWebServerRequest* r){
+      refreshNow = true; r->send(200, "text/plain", "SkyAware: refresh queued");
     });
 
-    // Force a fetch now (works even if enabled=false)
-    server.on("/um/skyaware/refresh", HTTP_GET, [this](AsyncWebServerRequest* r){
-      SA_DBG("manual refresh requested\n");
-      refreshNow = true;
-      r->send(200, "text/plain", "SkyAware: refresh queued");
-    });
-
-    // (NEW) Change airport via API and fetch immediately
-    server.on("/um/skyaware/set", HTTP_GET, [this](AsyncWebServerRequest* r){
+    server.on("/api/skyaware/set", HTTP_GET, [this](AsyncWebServerRequest* r){
       if (!r->hasParam("airport")) { r->send(400, "text/plain", "missing airport"); return; }
-      String a = r->getParam("airport")->value(); a.trim(); a.toUpperCase();
+      String a = upperTrim(r->getParam("airport")->value());
       if (a == "" || a.length()<3 || a.length()>8) { r->send(400, "text/plain", "bad airport"); return; }
       if (!a.equals(airportId)) {
         SA_DBG("airport change via /set: %s -> %s\n", airportId.c_str(), a.c_str());
         airportId = a;
-        triggerImmediateFetch("/um/skyaware/set");
+        syncSegMapSize();
+        for (auto& sm : segMaps) if (sm.mode==MAP_SINGLE && !sm.wholeAirport.length()) sm.wholeAirport=a;
+        triggerImmediateFetch("/api/skyaware/set");
       }
       r->send(200, "text/plain", airportId);
     });
 
-    // State JSON
-    server.on("/um/skyaware/state.json", HTTP_GET, [this](AsyncWebServerRequest* r){
-      AsyncResponseStream* res = r->beginResponseStream("application/json");
-      writeStateJson(*res);
-      r->send(res);
+    // Geometry + mapping
+    server.on("/api/skyaware/segments", HTTP_GET, [this](AsyncWebServerRequest* r){
+      AsyncResponseStream* res = r->beginResponseStream("application/json"); writeSegmentsJson(*res); r->send(res);
+    });
+    server.on("/api/skyaware/map", HTTP_POST, [this](AsyncWebServerRequest* r){
+      auto bad=[&](const char* m){ r->send(400,"text/plain",m); };
+      if (!r->hasParam("seg", true)) { bad("missing seg"); return; }
+      uint16_t segIdx = (uint16_t) r->getParam("seg", true)->value().toInt();
+      if (segIdx >= strip.getSegmentsNum()) { bad("seg out of range"); return; }
+      String modeStr = r->hasParam("mode", true) ? upperTrim(r->getParam("mode", true)->value()) : "SINGLE";
+      syncSegMapSize();
+      if (modeStr=="SINGLE") {
+        String ap = r->hasParam("airport", true) ? upperTrim(r->getParam("airport", true)->value()) : "";
+        if (!ap.length()) ap = airportId;
+        segMaps[segIdx].mode = MAP_SINGLE; segMaps[segIdx].wholeAirport = ap; segMaps[segIdx].perLed.clear();
+      } else if (modeStr=="MULTIPLE") {
+        String csv = r->hasParam("leds", true) ? r->getParam("leds", true)->value() : "";
+        parseLedCsv(segIdx, csv);
+      } else { bad("mode must be SINGLE or MULTIPLE"); return; }
+      triggerImmediateFetch("map update"); r->send(200,"text/plain","OK");
     });
 
-    // Diagnostics: Wi-Fi + loop gating
-    server.on("/um/skyaware/diag.json", HTTP_GET, [this](AsyncWebServerRequest* r){
-      StaticJsonDocument<512> d;
-      JsonObject j = d.to<JsonObject>();
-      j["wledConnected"] = (bool)WLED_CONNECTED;
-      j["wifiStatus"]    = (int)WiFi.status();     // WL_CONNECTED == 3
-      j["staIP"]         = WiFi.localIP().toString();
-      j["apIP"]          = WiFi.softAPIP().toString();
-      j["ssid"]          = WiFi.SSID();
-      j["rssi"]          = WiFi.RSSI();
-      j["bootPending"]   = bootFetchPending;
-      j["wasWifi"]       = wasWifiConnected;
-      j["sinceMs"]       = (int)(millis() - wifiConnectedSince);
-      j["lastRunMs"]     = (int)lastRunMs;
-      j["refreshNow"]    = refreshNow;
-      j["busy"]          = busy;
-      AsyncResponseStream* res = r->beginResponseStream("application/json");
-      serializeJson(d, *res);
-      r->send(res);
+    // HTTPS probe + state + log
+    server.on("/api/skyaware/https_test", HTTP_GET, [this](AsyncWebServerRequest* r){
+      std::vector<String> aps; gatherAllAirports(aps);
+      String ids; for (size_t i=0;i<aps.size();++i){ if(i) ids+=','; ids+=aps[i]; }
+      String url = "https://aviationweather.gov/api/data/metar?format=json&ids=" + (ids.length()?ids:getPrimaryAirportForSingle());
+      DynamicJsonDocument tmp(256);
+      bool ok = fetchJsonWithDiag(url, tmp, true);
+      StaticJsonDocument<512> d; JsonObject o = d.to<JsonObject>();
+      o["ok"]  = ok; o["err"] = lastErr; o["http"] = lastHttp; o["url"] = lastUrl;
+      JsonObject nd = o.createNestedObject("net"); writeDiagJson(nd);
+      o["bodyPrev"] = lastBodyPreview;
+      AsyncResponseStream* res = r->beginResponseStream("application/json"); serializeJson(d, *res); r->send(res);
     });
 
-    // Ring log endpoints
-    server.on("/um/skyaware/log.txt", HTTP_GET, [](AsyncWebServerRequest* r){
-      AsyncResponseStream* res = r->beginResponseStream("text/plain; charset=utf-8");
-      SA_LOGBUF.dumpTo(*res);
-      r->send(res);
-    });
-    server.on("/um/skyaware/log/clear", HTTP_GET, [](AsyncWebServerRequest* r){
-      SA_LOGBUF.clear();
-      r->send(200, "text/plain", "SkyAware log cleared");
+    server.on("/api/skyaware/state", HTTP_GET, [this](AsyncWebServerRequest* r){
+      AsyncResponseStream* res = r->beginResponseStream("application/json"); writeStateJson(*res); r->send(res);
     });
 
-    server.on("/um/skywizard/get", HTTP_GET, [this](AsyncWebServerRequest* r){
-      String json = String("{\"airport\":\"") + airportId + "\"}";
-      r->send(200, "application/json", json);
+    server.on("/api/skyaware/log", HTTP_GET, [](AsyncWebServerRequest* r){
+      AsyncResponseStream* res = r->beginResponseStream("text/plain; charset=utf-8"); SA_LOGBUF.dumpTo(*res); r->send(res);
     });
+    server.on("/api/skyaware/log/clear", HTTP_GET, [](AsyncWebServerRequest* r){ SA_LOGBUF.clear(); r->send(200,"text/plain","SkyAware log cleared"); });
 
-    // Let the captive page save the SAME settings as /settings/um
-    server.on("/um/skywizard/save", HTTP_POST, [this](AsyncWebServerRequest* r){
-      auto get = [&](const char* name)->String{
-        if (r->hasParam(name, true)) return r->getParam(name, true)->value();
-        if (r->hasParam(name))       return r->getParam(name)->value();
-        return String();
-      };
+    // ===== Back-compat redirects from old /um/skyaware/* =====
+    auto redir=[&](AsyncWebServerRequest* r, const char* to){
+      auto* resp=r->beginResponse(302,"text/plain",to); resp->addHeader("Location",to); r->send(resp);
+    };
+    server.on("/um/skyaware/state.json",  HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/state"); });
+    server.on("/um/skyaware/segments.json",HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/segments"); });
+    server.on("/um/skyaware/https_test",  HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/https_test"); });
+    server.on("/um/skyaware/log.txt",     HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/log"); });
+    server.on("/um/skyaware/log/clear",   HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/log/clear"); });
+    server.on("/um/skyaware/map",         HTTP_POST,[=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/map"); });
+    server.on("/um/skyaware/refresh",     HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/refresh"); });
+    server.on("/um/skyaware/enable",      HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/enable"); });
+    server.on("/um/skyaware/set",         HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/api/skyaware/set"); });
+    server.on("/skyaware/status",         HTTP_GET, [=](AsyncWebServerRequest* r){ redir(r,"/skyaware"); });
 
-      // Only set what you care about (airport). You can add more later.
-      String a = get("airport");
-      a.trim(); a.toUpperCase();
-
-      // basic validation: 3–8 alnum
-      bool ok = (a.length()>=3 && a.length()<=8);
-      for (size_t i=0; i<a.length() && ok; i++) {
-        char c=a[i]; ok = ((c>='A'&&c<='Z')||(c>='0'&&c<='9'));
-      }
-      if (ok) {
-        if (!a.equals(airportId)) {              // only trigger if it actually changed
-          SA_DBG("airport change: %s -> %s\n", airportId.c_str(), a.c_str());
-          airportId = a;                          // update runtime field used by your usermod
-          triggerImmediateFetch("wizard.save airport changed");
-        }
-      }
-
-      // go where you want next (default to Wi-Fi setup)
-      String redir = get("redir");
-      if (!redir.length()) redir = "/settings/wifi";
-      auto* resp = r->beginResponse(302, "text/plain", "saved");
-      resp->addHeader("Location", redir);
-      r->send(resp);
-    });
-
-    server.on("/skyaware/status", HTTP_GET, [this](AsyncWebServerRequest* r){
-      String html =
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<style>"
-          "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px;line-height:1.35;background:#fafafa;color:#111}"
-          "button{padding:8px 14px;border-radius:10px;border:1px solid #bbb;cursor:pointer;background:#fff}"
-          "pre{max-height:40vh;overflow:auto;background:#111;color:#0f0;padding:8px;border-radius:10px}"
-          ".row{display:flex;flex-wrap:wrap;gap:16px;align-items:center}"
-          ".card{border:1px solid #e5e5e5;border-radius:14px;padding:12px 14px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}"
-          ".big{font-size:1.8rem;font-weight:700}"
-          ".muted{color:#666}"
-          ".badge{display:inline-block;border-radius:999px;padding:6px 10px;border:1px solid #ccc;background:#fff}"
-          ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:10px}"
-          ".kv{border:1px solid #eee;border-radius:12px;padding:10px;background:#fff}"
-          ".kv h4{margin:0 0 6px 0;font-size:.85rem;color:#555;font-weight:600}"
-          ".kv .v{font-family:ui-monospace,Menlo,Consolas,monospace}"
-          ".catTag{display:inline-block;padding:6px 14px;border-radius:999px;border:1px solid #ccc;background:#f7f7f7;min-width:110px;text-align:center}"
-          ".catTag.VFR{background:#0a0;color:#fff;border-color:#070}"
-          ".catTag.MVFR{background:#08f;color:#fff;border-color:#06c}"
-          ".catTag.IFR{background:#d00;color:#fff;border-color:#a00}"
-          ".catTag.LIFR{background:#c0f;color:#111;border-color:#90c}"
-          ".catTag.UNKNOWN{background:#f6c57f;color:#111;border-color:#dea54a}"
-        "</style>"
-        "<h2>SkyAware Debug</h2>"
-
-        "<div class='row'>"
-          "<button onclick=\"fetch('/um/skyaware/refresh').then(()=>setTimeout(load,400))\">Fetch Now</button>"
-          "<label style='display:inline-flex;align-items:center;gap:.5rem;margin-left:1rem'>"
-            "<input type='checkbox' id='en'> Enabled"
-          "</label>"
-          "<a href='/settings/um' style='margin-left:auto'>← Back to Usermods</a>"
-        "</div>"
-
-        "<div class='row' style='margin-top:12px'>"
-          "<div class='card'><div class='muted'>Valid METAR fetches since boot</div>"
-            "<div class='big' id='okCount'>0</div></div>"
-          "<div class='card'><div class='muted'>Failures since boot</div>"
-            "<div class='big' id='failCount'>0</div></div>"
-          "<div class='card'><div class='muted'>Last fetch (ms)</div>"
-            "<div class='big' id='fetchMs'>0</div></div>"
-          "<div class='card'><div class='muted'>Last HTTP</div>"
-            "<div class='big' id='httpCode'>0</div></div>"
-          "<div class='card'><div class='muted'>Category</div>"
-            "<div class='big'><span id='catTag' class='catTag UNKNOWN'>UNKNOWN</span></div></div>"
-        "</div>"
-
-        "<p class='muted badge'>Also available: <a href='/um/skyaware/okcount' target=_blank>/um/skyaware/okcount</a>, "
-        "<a href='/um/skyaware/diag.json' target=_blank>diag.json</a>, "
-        "<a href='/um/skyaware/state.json' target=_blank>state.json</a></p>"
-
-        "<h3>METAR</h3>"
-        "<div class='card'>"
-          "<div class='grid'>"
-            "<div class='kv'><h4>Station</h4><div class='v' id='m_station'>—</div></div>"
-            "<div class='kv'><h4>Time (Z)</h4><div class='v' id='m_time'>—</div></div>"
-            "<div class='kv'><h4>Wind</h4><div class='v' id='m_wind'>—</div></div>"
-            "<div class='kv'><h4>Visibility</h4><div class='v' id='m_vis'>—</div></div>"
-            "<div class='kv'><h4>Clouds</h4><div class='v' id='m_clouds'>—</div></div>"
-            "<div class='kv'><h4>Temp/Dew</h4><div class='v' id='m_tempdew'>—</div></div>"
-            "<div class='kv'><h4>Altimeter</h4><div class='v' id='m_altim'>—</div></div>"
-            "<div class='kv'><h4>Weather</h4><div class='v' id='m_wx'>—</div></div>"
-            "<div class='kv' style='grid-column:1/-1'><h4>Remarks</h4><div class='v' id='m_rmk' style='white-space:pre-wrap'>—</div></div>"
-          "</div>"
-          "<div style='margin-top:10px'><h4 class='muted' style='margin:0 0 6px 0'>Raw</h4>"
-            "<pre id='metarRaw'>—</pre></div>"
-        "</div>"
-
-        "<h3>State</h3><pre id='state'>loading…</pre>"
-
-        "<h3>Live Log</h3>"
-        "<p><a href='/um/skyaware/log.txt' target=_blank>Open raw log</a> "
-        "<button onclick='fetch(\"/um/skyaware/log/clear\").then(()=>setTimeout(loadLog,300))'>Clear</button></p>"
-        "<pre id='log'>loading…</pre>"
-
-        "<script>"
-          "function applyCatTag(cat){"
-            "const el=document.getElementById('catTag');"
-            "el.textContent = (cat||'UNKNOWN').toUpperCase();"
-            "el.className = 'catTag ' + el.textContent;"
-          "}"
-          "function set(id,val){ document.getElementById(id).textContent = (val&&String(val).length)?val:'—'; }"
-          "async function load(){"
-            "try{"
-              "const j=await fetch('/um/skyaware/state.json').then(r=>r.json());"
-              "const s=j.SkyAware||{};"
-              "document.getElementById('state').textContent=JSON.stringify(j,null,2);"
-              "document.getElementById('en').checked=!!s.enabled;"
-              "document.getElementById('okCount').textContent = s.ok||0;"
-              "document.getElementById('failCount').textContent = s.fail||0;"
-              "document.getElementById('fetchMs').textContent = s.fetchMs||0;"
-              "document.getElementById('httpCode').textContent = s.http||0;"
-              "applyCatTag(s.category||'UNKNOWN');"
-              "set('metarRaw', s.metarRaw||'');"
-              "const m=s.metar||{};"
-              "set('m_station', m.station);"
-              "set('m_time',    m.timeZ);"
-              "set('m_wind',    m.wind);"
-              "set('m_vis',     m.vis);"
-              "set('m_clouds',  m.clouds);"
-              "set('m_tempdew', m.tempDew);"
-              "set('m_altim',   m.altim);"
-              "set('m_wx',      m.wx);"
-              "set('m_rmk',     m.remarks);"
-            "}catch(e){"
-              "document.getElementById('state').textContent='ERR '+e"
-            "}"
-          "}"
-          "async function loadLog(){"
-            "try{"
-              "const t=await fetch('/um/skyaware/log.txt').then(r=>r.text());"
-              "const lines=t.split('\\n');"
-              "document.getElementById('log').textContent=lines.slice(-300).join('\\n');"
-            "}catch(e){"
-              "document.getElementById('log').textContent='ERR '+e"
-            "}"
-          "}"
-          "document.getElementById('en').addEventListener('change',e=>{"
-            "fetch('/um/skyaware/enable?on='+(e.target.checked?1:0)).then(()=>setTimeout(load,300));"
-          "});"
-          "setInterval(load,1500); setInterval(loadLog,1500); load(); loadLog();"
-        "</script>";
-      r->send(200, "text/html", html);
-    });
-
-    // Only arm boot-fetch if user asked for it
+    // boot schedule
     bootFetchPending = autoFetchBoot;
     initOrRealignSchedule(false);
-    SA_DBG("setup done (bootFetchPending=%d)\n", (int)bootFetchPending);
-  } // <-- CLOSES setup()
+    syncSegMapSize();
+
+    SA_DBG("setup done\n");
+  }
 
   void loop() override {
-    static bool firstLoop = true;
-    if (firstLoop) { firstLoop = false; SA_DBG("loop entered\n"); }
+    static bool firstLoop = true; if (firstLoop) { firstLoop=false; SA_DBG("loop entered\n"); }
     if (busy) return;
 
-    // Optional boot-time fetch after Wi-Fi comes up (only if autoFetchBoot)
+    // boot settle
     if (bootFetchPending) {
       if (WLED_CONNECTED) {
-        if (!wasWifiConnected) {
-          wasWifiConnected = true;
-          wifiConnectedSince = millis();
-          SA_DBG("WiFi connected; settling for %u ms\n", (unsigned)BOOT_WIFI_SETTLE_MS);
-        }
-        if (millis() - wifiConnectedSince >= BOOT_WIFI_SETTLE_MS) {
-          SA_DBG("Boot-time fetch now\n");
-          refreshNow = true;
-          bootFetchPending = false;
-        }
-      } else {
-        if (wasWifiConnected) SA_DBG("WiFi dropped; waiting again\n");
-        wasWifiConnected = false;
-      }
+        if (!wasWifiConnected) { wasWifiConnected=true; wifiConnectedSince=millis(); SA_DBG("WiFi connected; settling %u ms\n",(unsigned)BOOT_WIFI_SETTLE_MS); }
+        if (millis()-wifiConnectedSince >= BOOT_WIFI_SETTLE_MS) { SA_DBG("Boot-time fetch now\n"); refreshNow=true; bootFetchPending=false; }
+      } else { if (wasWifiConnected) SA_DBG("WiFi dropped; waiting again\n"); wasWifiConnected=false; }
     }
 
-    // If not enabled and no manual refresh queued, stay idle
     if (!enabled && !refreshNow) return;
 
-    const uint32_t now    = millis();
+    const uint32_t now = millis();
     const uint32_t period = periodMs();
-
-    // Initialize or realign schedule if needed (e.g., after settings change)
-    if (nextScheduledAt == 0 || prevPeriodMs != period) {
-      initOrRealignSchedule(false);
-    }
-
-    // Manual/Immediate refresh: run attempt now without disturbing cadence.
-    if (refreshNow) {
-      // Start a transient mini-window that ends at the current nextScheduledAt
-      nextAttemptAt  = now;               // attempt now
-      windowDeadline = nextScheduledAt;   // do not cross the regular boundary
-      inRetryWindow  = true;              // allow backoffs if needed
-      retryIndex     = 0;
-      refreshNow     = false;
-    }
-
-    // Not time yet to attempt?
+    if (nextScheduledAt == 0 || prevPeriodMs != period) initOrRealignSchedule(false);
+    if (refreshNow) { nextAttemptAt=now; windowDeadline=nextScheduledAt; inRetryWindow=true; retryIndex=0; refreshNow=false; }
     if (!timeReached(nextAttemptAt)) return;
 
-    // ===== Perform one attempt (either scheduled tick or in-window retry) =====
-    SA_DBG("loop: attempt (window ends in %lus)\n",
+    SA_DBG("attempt (window ends in %lus)\n",
            (unsigned long)((windowDeadline > now) ? ((windowDeadline - now)/1000) : 0));
 
     busy = true;
-    const bool ok = fetchMetarOnce();
+    std::vector<String> airports; gatherAllAirports(airports);
+    bool ok = (airports.size()<=1) ? fetchMetarOnce() : fetchMetarMulti(airports);
     busy = false;
 
     if (ok) {
-      // SUCCESS: keep LEDs as set by fetch (lastGoodCat), clear retry state.
-      inRetryWindow = false;
-      retryIndex = 0;
-
-      // Advance cadence to the next whole period boundary (no drift)
+      applyLayoutColors();
+      inRetryWindow=false; retryIndex=0; forcedDnsThisWindow=false;
       while (timeReached(nextScheduledAt)) nextScheduledAt += period;
-
-      windowDeadline = nextScheduledAt;
-      nextAttemptAt  = nextScheduledAt;
-
-      lastRunMs = now;  // observability (how long since last activity)
-
-      SA_DBG("ok: kept %s, next @ +%lus\n",
-             lastGoodCat.c_str(),
-             (unsigned long)((nextAttemptAt > millis()) ? ((nextAttemptAt - millis())/1000) : 0));
+      windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
+      SA_DBG("ok: next in %lus (airports=%u)\n",
+             (unsigned long)((nextAttemptAt > millis()) ? ((nextAttemptAt - millis())/1000) : 0),
+             (unsigned)airports.size());
       return;
     }
 
-    // ===== FAILURE: do NOT flip LEDs yet; try retries within the same window =====
-    if (!inRetryWindow) {
-      // Enter retry mode for this window
-      inRetryWindow = true;
-      retryIndex = 0;
-      windowDeadline = nextScheduledAt;   // finish all retries before the boundary
-    }
-
-    // If the window has expired, decide what to show and move to next window.
+    if (!inRetryWindow) { inRetryWindow=true; retryIndex=0; windowDeadline=nextScheduledAt; }
     if (timeReached(windowDeadline)) {
-      inRetryWindow = false;
-      retryIndex = 0;
-
-      if (haveGoodCat) {
-        // Keep last known good; do not override with UNKNOWN
-        SA_DBG("window expired, keeping last good: %s\n", lastGoodCat.c_str());
-      } else {
-        // No good data at all in this boot/session → show UNKNOWN/AMBER
-        applyCategoryColor("UNKNOWN");
-        SA_DBG("window expired → UNKNOWN/AMBER\n");
-      }
-
-      nextScheduledAt += period;
-      windowDeadline = nextScheduledAt;
-      nextAttemptAt  = nextScheduledAt;
-      lastRunMs = now;
+      inRetryWindow=false; retryIndex=0; forcedDnsThisWindow=false;
+      bool anyGood=false; for (auto& e: apCache) if (e.good) { anyGood=true; break; }
+      if (!anyGood) { for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(255,255,255,0)); strip.trigger(); }
+      else applyLayoutColors();
+      nextScheduledAt += period; windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
       return;
     }
 
-    // Schedule another retry inside the window (backoff and clamp)
     if (retryIndex + 1 < RETRY_COUNT) retryIndex++;
     uint32_t candidate = millis() + RETRY_DELAYS_MS[retryIndex];
     nextAttemptAt = (candidate < windowDeadline) ? candidate : windowDeadline;
-
-    SA_DBG("retry %u/%u at +%lus (window ends in %lus)\n",
-           (unsigned)retryIndex, (unsigned)(RETRY_COUNT-1),
-           (unsigned long)((nextAttemptAt > millis()) ? ((nextAttemptAt - millis())/1000) : 0),
-           (unsigned long)((windowDeadline > millis()) ? ((windowDeadline - millis())/1000) : 0));
   }
 
-  // ---------- config UI (persists via /settings/um) ----------
+  // ---------- config JSON ----------
   void addToConfig(JsonObject& root) override {
+    syncSegMapSize();
     JsonObject top = root.createNestedObject("skyAwareUsermod");
     top["Enabled"]               = enabled;
     top["Auto Fetch on Boot"]    = autoFetchBoot;
-    top["Airport ID"]            = airportId;      // e.g., "KPDX"
-    top["Update Frequency (min)"]= updateInterval; // minutes
+    top["Airport ID"]            = airportId;
+    top["Update Frequency (min)"]= updateInterval;
+
+    JsonArray maps = top.createNestedArray("Mappings");
+    uint16_t numSegs = strip.getSegmentsNum();
+    for (uint16_t si=0; si<numSegs; ++si) {
+      JsonObject m = maps.createNestedObject();
+      m["Segment"] = si;
+      m["Mode"]    = modeLabel(segMaps[si].mode);
+      if (segMaps[si].mode == MAP_SINGLE) {
+        m["Airport"] = segMaps[si].wholeAirport;
+      } else {
+        Segment& seg = strip.getSegment(si);
+        uint16_t len = (seg.stop>seg.start)?(seg.stop-seg.start):0;
+        if (segMaps[si].perLed.size()!=len) segMaps[si].perLed.resize(len);
+        String csv;
+        for (uint16_t i=0;i<len;i++) {
+          if (i) csv += ",";
+          const LedEntry& le = segMaps[si].perLed[i];
+          if (le.type==LT_SKIP) csv += "-";
+          else if (le.type==LT_ICAO) csv += le.value;
+          else csv += "IND:" + le.value;
+        }
+        m["CSV"] = csv;
+      }
+    }
   }
 
   bool readFromConfig(JsonObject& root) override {
@@ -859,12 +1014,29 @@ public:
     configComplete &= getJsonValue(top["Update Frequency (min)"],updateInterval,(uint16_t)5);
 
     if (updateInterval < 1) updateInterval = 1;
-    airportId.toUpperCase();
+    airportId = upperTrim(airportId);
 
-    // realign if interval changed
+    syncSegMapSize();
+    if (top.containsKey("Mappings") && top["Mappings"].is<JsonArray>()) {
+      JsonArray maps = top["Mappings"].as<JsonArray>();
+      for (JsonObject m : maps) {
+        uint16_t si = m["Segment"] | 0;
+        if (si >= strip.getSegmentsNum()) continue;
+        String mode = m["Mode"] | "SINGLE";
+        if (mode == "SINGLE") {
+          segMaps[si].mode = MAP_SINGLE;
+          segMaps[si].wholeAirport = upperTrim(String(m["Airport"] | ""));
+          if (!segMaps[si].wholeAirport.length()) segMaps[si].wholeAirport = airportId;
+          segMaps[si].perLed.clear();
+        } else if (mode == "MULTIPLE") {
+          segMaps[si].mode = MAP_MULTIPLE;
+          String csv = m["CSV"] | "";
+          parseLedCsv(si, csv);
+        }
+      }
+    }
+
     if (updateInterval != oldInterval) initOrRealignSchedule(false);
-
-    // immediate fetch if airport changed
     if (!airportId.equals(oldAirport)) {
       SA_DBG("airport change via settings: %s -> %s\n", oldAirport.c_str(), airportId.c_str());
       triggerImmediateFetch("settings.um airport changed");
@@ -891,6 +1063,12 @@ public:
     s["ok"]         = successCount;
     s["fail"]       = failureCount;
     s["bootWaitMs"] = (int)BOOT_WIFI_SETTLE_MS;
+
+    JsonArray a = s.createNestedArray("mappedAirports");
+    std::vector<String> aps; gatherAllAirports(aps);
+    for (auto& id : aps) { JsonObject o = a.createNestedObject(); o["id"]=id; o["cat"]=getCatForAirport(id); }
+
+    JsonObject nd = s.createNestedObject("net"); writeDiagJson(nd);
   }
 
   uint16_t getId() override { return USERMOD_ID_SKYAWARE; }
