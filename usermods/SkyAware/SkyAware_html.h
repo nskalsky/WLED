@@ -1,282 +1,1109 @@
+// skyaware_html.h - IMPROVED VERSION
 #pragma once
+#include <pgmspace.h>
 
-// Simple, inline UI for /skyaware (no external assets).
-// Served from PROGMEM to save RAM.
-
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP8266)
-  #include <pgmspace.h>
-#endif
-
-static const char SKY_UI_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<meta name=viewport content="width=device-width,initial-scale=1">
+static const char SKY_UI_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SkyAware</title>
 <style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:16px;color:#111}
-  .wrap{max-width:980px}
-  .card{border:1px solid #e5e5e5;border-radius:12px;padding:14px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04);margin-bottom:14px}
-  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-  label{display:inline-flex;align-items:center;gap:.5rem}
-  input[type=text],select{padding:.45rem .6rem;border:1px solid #ccc;border-radius:8px;font:inherit}
-  button{padding:.48rem .9rem;border:1px solid #bbb;border-radius:10px;background:#fff;cursor:pointer}
-  table{border-collapse:collapse;width:100%}
-  th,td{border:1px solid #eee;padding:8px;text-align:left;font-size:.95rem}
-  .muted{color:#666}.ok{color:#0a0}.err{color:#c00}
-  .badge{display:inline-block;padding:6px 10px;border:1px solid #ccc;border-radius:999px;background:#fafafa}
-  .catTag{display:inline-block;padding:6px 14px;border-radius:999px;border:1px solid #ccc;background:#f7f7f7;min-width:110px;text-align:center}
-  .catTag.VFR{background:#0a0;color:#fff;border-color:#070}
-  .catTag.MVFR{background:#08f;color:#fff;border-color:#06c}
-  .catTag.IFR{background:#d00;color:#fff;border-color:#a00}
-  .catTag.LIFR{background:#c0f;color:#111;border-color:#90c}
-  .catTag.UNKNOWN{background:#eee;color:#111;border-color:#ccc}
-  .kv{display:grid;grid-template-columns:160px 1fr;gap:6px 10px}
-  .hidden{display:none}
-  .mt{margin-top:12px}
+  :root{
+    --bg:#0f1115; --card:#171a21; --muted:#8a93a6; --text:#e8ecf3;
+    --hr:#242938; --ok:#2fa84f; --warn:#c9a227; --danger:#d14b4b; --btn:#30364a;
+    --vfr:#20c15a; --mvfr:#3a68ff; --ifr:#ff4b4b; --lifr:#ff3fff; --unknown:#d8dee9;
+  }
+  html,body{background:var(--bg);color:var(--text);font:14px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
+  .wrap{max-width:1120px;margin:20px auto;padding:0 12px}
+  .row{display:flex;gap:8px;align-items:center}
+  .grow{flex:1}
+  .card{background:var(--card);border-radius:12px;padding:14px 16px;box-shadow:0 1px 0 rgba(255,255,255,.02) inset}
+  .hr{height:1px;background:var(--hr);margin:12px 0}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .btn{background:var(--btn);color:var(--text);border:1px solid #3b425a;border-radius:10px;padding:8px 12px;cursor:pointer;transition:all .2s}
+  .btn:hover:not(:disabled){background:#3a4157;border-color:#4a5270}
+  .btn:disabled{opacity:.6;cursor:not-allowed}
+  .btn-ok{background:var(--ok);border-color:#2a8745}
+  .btn-ok:hover:not(:disabled){background:#28a047}
+  .btn-warn{background:var(--warn);border-color:#a78d23}
+  .btn-warn:hover:not(:disabled){background:#b59a25}
+  .btn-danger{background:var(--danger);border-color:#b33f3f}
+  .btn-danger:hover:not(:disabled){background:#c34545}
+  label{display:block;margin:2px 0 6px 0;font-weight:600}
+  input[type=text],select{background:#0c0f16;color:var(--text);border:1px solid #3b425a;border-radius:10px;padding:7px 9px;width:100%;transition:border-color .2s}
+  input[type=text]:focus,select:focus{outline:none;border-color:#5a6a8a}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:6px 8px;border-bottom:1px solid var(--hr);vertical-align:middle}
+  th{color:#aab3c7;font-weight:600;text-align:left}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .chip{display:inline-block;width:18px;height:18px;border-radius:4px;border:1px solid #0003;margin-right:6px;vertical-align:middle}
+  .msg{margin:10px 0 0 0;font-weight:600}
+  .pill{padding:2px 8px;border-radius:999px;background:#1f2330;border:1px solid #394057;font-size:12px}
+  .pill-large{padding:4px 12px;font-size:13px;font-weight:600}
+  .knum{opacity:.9}
+  .tight{margin-top:-4px}
+  .small{font-size:12px}
+  .overflow{max-height:260px;overflow:auto;border:1px solid var(--hr);border-radius:10px}
+  .right{justify-content:flex-end}
+  
+  /* Flight category display */
+  .flight-cat-banner{
+    background:linear-gradient(135deg, rgba(255,255,255,.03), rgba(255,255,255,.01));
+    border-radius:10px;
+    padding:12px 16px;
+    margin-top:8px;
+    border:2px solid var(--hr);
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
+  .flight-cat-banner.vfr{border-color:var(--vfr);background:linear-gradient(135deg, rgba(32,193,90,.15), rgba(32,193,90,.05))}
+  .flight-cat-banner.mvfr{border-color:var(--mvfr);background:linear-gradient(135deg, rgba(58,104,255,.15), rgba(58,104,255,.05))}
+  .flight-cat-banner.ifr{border-color:var(--ifr);background:linear-gradient(135deg, rgba(255,75,75,.15), rgba(255,75,75,.05))}
+  .flight-cat-banner.lifr{border-color:var(--lifr);background:linear-gradient(135deg, rgba(255,63,255,.15), rgba(255,63,255,.05))}
+  .flight-cat-icon{
+    width:48px;
+    height:48px;
+    border-radius:8px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-weight:700;
+    font-size:16px;
+    border:2px solid rgba(255,255,255,.1);
+  }
+  .flight-cat-icon.vfr{background:var(--vfr);color:#fff}
+  .flight-cat-icon.mvfr{background:var(--mvfr);color:#fff}
+  .flight-cat-icon.ifr{background:var(--ifr);color:#fff}
+  .flight-cat-icon.lifr{background:var(--lifr);color:#fff}
+  .flight-cat-icon.unknown{background:var(--unknown);color:#333}
+  
+  /* Mode indicator */
+  .mode-indicator{
+    display:flex;
+    gap:6px;
+    padding:10px 14px;
+    background:rgba(255,255,255,.02);
+    border-radius:8px;
+    border:1px solid var(--hr);
+  }
+  .mode-badge{
+    padding:6px 12px;
+    border-radius:6px;
+    font-weight:600;
+    font-size:13px;
+    opacity:.4;
+    transition:all .2s;
+  }
+  .mode-badge.active{
+    opacity:1;
+    background:rgba(58,104,255,.2);
+    color:#5a8fff;
+    border:1px solid rgba(58,104,255,.4);
+  }
+  
+  /* Unsaved changes warning */
+  .unsaved-warning{
+    background:rgba(201,162,39,.15);
+    border:2px solid var(--warn);
+    border-radius:10px;
+    padding:10px 14px;
+    margin-top:10px;
+    display:none;
+    align-items:center;
+    gap:10px;
+  }
+  .unsaved-warning.show{display:flex}
+  .warning-icon{
+    font-size:20px;
+    font-weight:700;
+    color:var(--warn);
+  }
+  
+  /* Save state indicator */
+  .save-status{
+    font-size:12px;
+    padding:4px 10px;
+    border-radius:6px;
+    font-weight:600;
+    display:none;
+  }
+  .save-status.saved{
+    display:inline-block;
+    background:rgba(47,168,79,.15);
+    color:var(--ok);
+    border:1px solid rgba(47,168,79,.3);
+  }
+  .save-status.unsaved{
+    display:inline-block;
+    background:rgba(201,162,39,.15);
+    color:var(--warn);
+    border:1px solid rgba(201,162,39,.3);
+  }
+  
+  /* Help text */
+  .help-text{
+    background:rgba(58,104,255,.08);
+    border-left:3px solid var(--mvfr);
+    padding:10px 12px;
+    border-radius:6px;
+    margin:8px 0;
+    font-size:12px;
+    line-height:1.5;
+  }
+  .help-text strong{color:var(--mvfr)}
+  
+  /* LED Identification button */
+  .btn-id{
+    background:rgba(58,104,255,.3);
+    border-color:rgba(58,104,255,.5);
+    color:#5a8fff;
+    font-weight:600;
+    padding:6px 10px;
+    font-size:12px;
+    min-width:50px;
+  }
+  .btn-id:hover:not(:disabled){
+    background:rgba(58,104,255,.5);
+    border-color:#5a8fff;
+  }
+  .btn-id.active{
+    background:#3a68ff;
+    border-color:#2a5aff;
+    color:#fff;
+  }
+  
+  /* LED identification info banner */
+  .led-ident-banner{
+    background:rgba(58,104,255,.15);
+    border:2px solid var(--mvfr);
+    border-radius:10px;
+    padding:10px 14px;
+    margin-top:10px;
+    display:none;
+    align-items:center;
+    gap:12px;
+    font-size:13px;
+  }
+  .led-ident-banner.show{
+    display:flex;
+  }
+  .led-ident-pulse{
+    display:inline-block;
+    width:12px;
+    height:12px;
+    background:#3a68ff;
+    border-radius:50%;
+  }
 </style>
+</head>
+<body>
+<div class="wrap">
 
-<div class=wrap>
-  <h2>SkyAware</h2>
-
-  <!-- Status (TOP) -->
-  <div class=card>
-    <div class=row>
-      <div><b>Status</b></div>
-      <span id=catTop class="catTag UNKNOWN">UNKNOWN</span>
-      <button id=btnRefresh>Fetch Now</button>
-      <span id=msg class="muted" style="margin-left:auto"></span>
-    </div>
-    <div class=row style="align-items:flex-start">
-      <div style="flex:1;min-width:260px">
-        <div class=kv>
-          <div>Next update</div><div id=kvNext>—</div>
-          <div>Airport</div><div id=kvAirport>—</div>
-          <div>Station</div><div id=kvStation>—</div>
-          <div>Obs Time</div><div id=kvTimeZ>—</div>
-          <div>Wind</div><div id=kvWind>—</div>
-          <div>Visibility</div><div id=kvVis>—</div>
-          <div>Clouds</div><div id=kvClouds>—</div>
-          <div>Temp/Dew</div><div id=kvTempDew>—</div>
-          <div>Altimeter</div><div id=kvAltim>—</div>
+  <!-- STATUS -->
+  <div class="card">
+    <div class="row">
+      <div class="grow">
+        <div class="row tight">
+          <div class="pill pill-large">SkyAware</div>
+          <div id="p_enabled" class="pill">—</div>
+          <span id="saveStatus" class="save-status">● Saved to device</span>
         </div>
+        <div class="muted small" style="margin-top:6px">
+          <span id="p_url">—</span>
+        </div>
+        <div class="muted small" id="p_err" style="color:var(--danger)"></div>
       </div>
-      <div style="flex:1;min-width:260px">
-        <div class=kv>
-          <div>HTTP</div><div id=kvHttp>—</div>
-          <div>DNS</div><div id=kvDns>—</div>
-          <div>Timings</div><div id=kvTimes>—</div>
-          <div>Wi-Fi</div><div id=kvWifi>—</div>
-          <div>Counts</div><div id=kvCounts>—</div>
-          <div>Last URL</div><div id=kvUrl style="overflow:auto;white-space:nowrap">—</div>
-        </div>
+      <div class="row">
+        <button id="btnRefresh" class="btn">🔄 Refresh Now</button>
       </div>
     </div>
-    <div class=mt><span class=badge>Inspect:
-      <a href="/api/skyaware/state" target=_blank>state</a>,
-      <a href="/api/skyaware/segments" target=_blank>segments</a>,
-      <a href="/api/skyaware/https_test" target=_blank>https_test</a>,
-      <a href="/api/skyaware/log" target=_blank>log</a>
-    </span></div>
+
+    <!-- MODE INDICATOR -->
+    <div class="hr"></div>
+    <div class="row" style="align-items:flex-start;gap:12px">
+      <div class="mode-indicator">
+        <div class="mode-badge" id="modeBadgeSingle">
+          <span style="font-size:16px">🎯</span> SINGLE
+        </div>
+        <div class="mode-badge" id="modeBadgeMulti">
+          <span style="font-size:16px">🗺️</span> MULTIPLE
+        </div>
+      </div>
+      <div class="grow" id="singleModeInfo" style="display:none">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Primary Airport</div>
+        <div style="font-size:16px;font-weight:700;font-family:monospace" id="primaryAirport">—</div>
+      </div>
+      <div class="grow" id="multiModeInfo" style="display:none">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Mapped Airports</div>
+        <div style="font-size:14px;font-weight:600" id="airportCount">—</div>
+      </div>
+    </div>
+
+    <!-- FLIGHT CATEGORY BANNER (Single Mode Only) -->
+    <div id="flightCatBanner" class="flight-cat-banner" style="display:none">
+      <div class="flight-cat-icon" id="flightCatIcon">—</div>
+      <div class="grow">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:600">Flight Category</div>
+        <div style="font-size:18px;font-weight:700;margin:2px 0" id="flightCatText">—</div>
+        <div style="font-size:12px;color:var(--muted)" id="flightCatDesc">—</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">METAR</div>
+        <div style="font-size:12px;font-family:monospace" id="metarSummary">—</div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+    <div class="row">
+      <div class="grow">
+        <div class="row" style="flex-wrap:wrap;gap:12px">
+          <div><span class="muted">HTTP:</span> <span class="mono" id="p_http">—</span></div>
+          <div><span class="muted">Last OK:</span> <span class="mono" id="p_lastok">—</span>s</div>
+          <div><span class="muted">Next:</span> <span class="mono" id="p_eta">—</span>s</div>
+          <div><span class="muted">Period:</span> <span class="mono" id="p_period">—</span>s</div>
+          <div><span class="muted">Retries:</span> <span class="mono" id="p_retry">—</span></div>
+        </div>
+        <div class="muted small" style="margin-top:4px">WiFi: <span id="p_wifi">—</span></div>
+      </div>
+      <div>
+        <label style="margin-bottom:8px">Default Station ID</label>
+        <div class="row">
+          <input type="text" id="inpAirport" class="mono" placeholder="KPDX" style="width:120px">
+          <button id="btnSetAp" class="btn btn-ok">Set & Refresh</button>
+      </div></div>
+    </div>
   </div>
 
-  <!-- Mapping / Config (BOTTOM) -->
-  <div class=card>
-    <div class=row>
-      <div><b>Mapping</b></div>
-      <label>Segment <select id=segSel></select></label>
-      <label><input type=radio name=mode value=SINGLE checked> Single airport</label>
-      <label><input type=radio name=mode value=MULTIPLE> Multiple airports</label>
+  <!-- MAPPING EDITOR -->
+  <div class="card" style="margin-top:12px">
+    <div class="row">
+      <div class="grow">
+        <div style="font-size:16px;font-weight:700;margin-bottom:8px">Segment Configuration</div>
+        <div class="row">
+          <div><strong>Segment</strong></div>
+          <select id="selSeg" style="width:80px"></select>
+          <div class="muted">Start:</div><div id="segStart" class="mono knum">—</div>
+          <div class="muted">Stop:</div><div id="segStop" class="mono knum">—</div>
+          <div class="muted">LEDs:</div><div id="segLen" class="mono knum" style="font-weight:700">—</div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <div class="muted">Display Mode:</div>
+          <select id="selMode" style="width:140px">
+            <option value="SINGLE">Single Airport</option>
+            <option value="MULTIPLE">Multiple Airports</option>
+          </select>
+          <span id="segMode" class="pill">—</span>
+        </div>
+      </div>
+      <div class="row right">
+        <input id="fileCsv" type="file" accept=".csv,text/csv" style="display:none">
+        <button id="btnCsvDown" class="btn">⬇ CSV</button>
+        <button id="btnCsvUp" class="btn">⬆ CSV</button>
+        <button id="btnClear" class="btn btn-danger">Clear</button>
+        <button id="btnSave" class="btn btn-ok" style="font-weight:700">💾 Save to Device</button>
+      </div>
     </div>
 
-    <div id=singleBox class=mt>
-      <label>Airport <input id=singleAirport type=text placeholder=KPDX maxlength=8></label>
-      <button id=saveSingle>Save</button>
-      <span style="margin-left:8px">Category: <span id=catTag class="catTag UNKNOWN">UNKNOWN</span></span>
+    <!-- Unsaved changes warning -->
+    <div id="unsavedWarning" class="unsaved-warning">
+      <div class="warning-icon">⚠</div>
+      <div class="grow">
+        <strong>Unsaved Changes</strong> — Click "Save to Device" to persist your mapping configuration to WLED.
+      </div>
     </div>
 
-    <div id=multiBox class="mt hidden">
-      <div class=muted>Enter airport codes for each LED index. Use '-' to Skip.</div>
-      <table class=mt>
-        <thead id=ledHead><tr><th style="width:100px">LED #</th><th>Airport</th><th style="width:130px">Cat</th></tr></thead>
-        <tbody id=ledTable></tbody>
+    <div class="help-text">
+      <strong>Single Mode:</strong> All LEDs in this segment show the same airport.<br>
+      <strong>Multiple Mode:</strong> Each LED can show a different airport. Use shorthand like <code>KPDX+5</code> to fill 5 LEDs with KPDX, or list individually.
+    </div>
+
+    <div class="hr"></div>
+    <div class="muted small" style="margin-bottom:6px">
+      <strong>Per-LED Airport Mapping</strong> (one row per LED)
+    </div>
+
+    <div class="overflow">
+      <table id="tblMap">
+        <thead>
+          <tr>
+            <th style="width:84px">LED Index</th>
+            <th style="width:92px">Abs LED</th>
+            <th style="width:50px">ID</th>
+            <th style="width:200px">Station ID</th>
+            <th style="width:160px">Flight Category</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody id="mapBody"></tbody>
       </table>
-      <div class=mt><button id=saveMulti>Save</button></div>
     </div>
   </div>
+
+  <!-- DIAGNOSTICS -->
+  <div class="card" style="margin-top:12px">
+    <div class="row">
+      <div class="grow"><div style="font-size:16px;font-weight:700">Network Diagnostics</div></div>
+      <div class="row">
+        <button id="btnLoadState" class="btn">Refresh State</button>
+        <button id="btnHttpsTest" class="btn">Run HTTPS Test</button>
+      </div>
+    </div>
+    <div class="hr"></div>
+    <table>
+      <tbody>
+        <tr><td class="muted">DNS Provider</td><td class="mono" id="d_dnsProv">—</td></tr>
+        <tr><td class="muted">DNS Fallback Used</td><td class="mono" id="d_dnsFb">—</td></tr>
+        <tr><td class="muted">Stage</td><td class="mono" id="d_stage">—</td></tr>
+        <tr><td class="muted">Detail</td><td class="mono" id="d_detail">—</td></tr>
+        <tr><td class="muted">DNS ms</td><td class="mono" id="d_dnsMs">—</td></tr>
+        <tr><td class="muted">TCP ms</td><td class="mono" id="d_tcpMs">—</td></tr>
+        <tr><td class="muted">TLS ms</td><td class="mono" id="d_tlsMs">—</td></tr>
+        <tr><td class="muted">HTTP ms</td><td class="mono" id="d_httpMs">—</td></tr>
+        <tr><td class="muted">HTTP Code</td><td class="mono" id="d_http">—</td></tr>
+        <tr><td class="muted">Redirect</td><td class="mono" id="d_redirect">—</td></tr>
+        <tr><td class="muted">Bytes</td><td class="mono" id="d_bytes">—</td></tr>
+        <tr><td class="muted">Last URL</td><td class="mono" id="d_url">—</td></tr>
+        <tr><td class="muted">OK</td><td class="mono" id="d_ok">—</td></tr>
+      </tbody>
+    </table>
+    <div class="hr"></div>
+    <div class="muted small">Raw /state response</div>
+    <pre id="diagRaw" class="mono overflow" style="max-height:320px">—</pre>
+  </div>
+
+  <div id="msg" class="msg"></div>
 </div>
 
 <script>
-const $=s=>document.querySelector(s);
-const segSel=$('#segSel'), singleBox=$('#singleBox'), multiBox=$('#multiBox'), ledTable=$('#ledTable'), ledHead=$('#ledHead'), msg=$('#msg');
+/*** Elements ***/
+const msg = document.getElementById('msg');
+const p_enabled = document.getElementById('p_enabled');
+const p_http    = document.getElementById('p_http');
+const p_url     = document.getElementById('p_url');
+const p_err     = document.getElementById('p_err');
+const p_lastok  = document.getElementById('p_lastok');
+const p_eta     = document.getElementById('p_eta');
+const p_period  = document.getElementById('p_period');
+const p_retry   = document.getElementById('p_retry');
+const p_wifi    = document.getElementById('p_wifi');
+const inpAirport= document.getElementById('inpAirport');
+const saveStatus= document.getElementById('saveStatus');
+const unsavedWarning = document.getElementById('unsavedWarning');
 
-function showMsg(t,ok=true){msg.textContent=t;msg.className=ok?'ok':'err';setTimeout(()=>{msg.textContent='';msg.className='muted';},1800);}
-function applyCatTag(el,cat){const x=(cat||'UNKNOWN').toUpperCase();el.textContent=x;el.className='catTag '+x;}
+const modeBadgeSingle = document.getElementById('modeBadgeSingle');
+const modeBadgeMulti  = document.getElementById('modeBadgeMulti');
+const singleModeInfo  = document.getElementById('singleModeInfo');
+const multiModeInfo   = document.getElementById('multiModeInfo');
+const primaryAirport  = document.getElementById('primaryAirport');
+const airportCount    = document.getElementById('airportCount');
+const flightCatBanner = document.getElementById('flightCatBanner');
+const flightCatIcon   = document.getElementById('flightCatIcon');
+const flightCatText   = document.getElementById('flightCatText');
+const flightCatDesc   = document.getElementById('flightCatDesc');
+const metarSummary    = document.getElementById('metarSummary');
 
-let segments=[], current=null;
+const selSeg    = document.getElementById('selSeg');
+const segStart  = document.getElementById('segStart');
+const segStop   = document.getElementById('segStop');
+const segLen    = document.getElementById('segLen');
+const selMode   = document.getElementById('selMode');
+const segMode   = document.getElementById('segMode');
+const mapBody   = document.getElementById('mapBody');
 
-// Countdown state
-let countdownTimer = null;
-let countdownSecs = 0;
-function formatHMS(t){
-  const s = Math.max(0, Math.floor(t));
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
-  return h>0 ? `${h}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
-             : `${m}:${String(ss).padStart(2,'0')}`;
-}
-function startCountdown(sec){
-  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer=null; }
-  countdownSecs = Math.max(0, Math.floor(sec||0));
-  const tick = () => {
-    $('#kvNext').textContent = countdownSecs>0 ? `${formatHMS(countdownSecs)}` : 'now';
-    if (countdownSecs<=0) { clearInterval(countdownTimer); countdownTimer=null; return; }
-    countdownSecs--;
-  };
-  tick();
-  countdownTimer = setInterval(tick, 1000);
-}
+const btnCsvDown = document.getElementById('btnCsvDown');
+const btnCsvUp   = document.getElementById('btnCsvUp');
+const btnClear   = document.getElementById('btnClear');
+const fileCsv    = document.getElementById('fileCsv');
 
-async function loadSegments(){
-  const j=await fetch('/api/skyaware/segments').then(r=>r.json());
-  segments=j.segments||[]; segSel.innerHTML='';
-  for(const s of segments){const o=document.createElement('option');o.value=s.index;o.textContent=`${s.index} (len ${s.length})`;segSel.appendChild(o);}
-  if(segments.length){segSel.value=segments[0].index;selectSeg();}
-}
+const d_dnsProv = document.getElementById('d_dnsProv');
+const d_dnsFb   = document.getElementById('d_dnsFb');
+const d_stage   = document.getElementById('d_stage');
+const d_detail  = document.getElementById('d_detail');
+const d_dnsMs   = document.getElementById('d_dnsMs');
+const d_tcpMs   = document.getElementById('d_tcpMs');
+const d_tlsMs   = document.getElementById('d_tlsMs');
+const d_httpMs  = document.getElementById('d_httpMs');
+const d_http    = document.getElementById('d_http');
+const d_redirect= document.getElementById('d_redirect');
+const d_bytes   = document.getElementById('d_bytes');
+const d_url     = document.getElementById('d_url');
+const d_ok      = document.getElementById('d_ok');
+const diagRaw   = document.getElementById('diagRaw');
 
-function getMode(){return document.querySelector('input[name=mode]:checked').value;}
-function setMode(m){
-  document.querySelector(`input[name=mode][value=${m}]`).checked=true;
-  const multi = (m==='MULTIPLE');
-  singleBox.classList.toggle('hidden', multi);
-  multiBox.classList.toggle('hidden', !multi);
-  if (multi && current) {
-    const vals=(current.map&&Array.isArray(current.map.leds))?current.map.leds:[];
-    buildLedTable(current.length||0, vals, true);
-  } else {
-    buildLedTable(0, [], false);
+/*** State ***/
+let STATE = {};
+let SEGMENTS = [];
+let AIRCAT = {};
+let tickTimer = null;
+let hasUnsavedChanges = false;
+
+/* Per-segment scratch; strictly separated per mode.
+   cache[segIdx] = { mode:'SINGLE'|'MULTIPLE',
+                     singleAirport:'KXXX[+N]',
+                     multi:[... per-LED ...],
+                     len,start,stop }
+   Persisted to localStorage so MULTIPLE isn't lost by reloads/mode flips.
+*/
+const cache = {};
+const LSK = 'skyaware-cache-v2';
+
+/*** LED IDENTIFICATION STATE & FUNCTIONS ***/
+
+// Global state for LED identification
+let ledIdentState = {
+  active: false,
+  ledIndex: null,
+  identifyingSegIdx: null
+};
+
+// Function to start LED identification for a specific LED
+async function startLedIdentification(ledAbsIndex) {
+  try {
+    const r = await fetch('/api/skyaware/led/identify?idx=' + ledAbsIndex);
+    if (!r.ok) throw new Error('LED identify failed: '+r.status);
+    
+    ledIdentState.active = true;
+    ledIdentState.ledIndex = ledAbsIndex;
+    updateLedIdentUI();
+    
+  } catch (e) {
+    console.error('LED identification error:', e);
+    setMsg('LED identification failed: '+e.message, 'var(--danger)');
   }
 }
 
-function selectSeg(){
-  const idx=parseInt(segSel.value||0);
-  current=segments.find(s=>s.index===idx);
-  if(!current){ledTable.innerHTML='';return;}
-  const m=(current.map&&current.map.mode)||'SINGLE';
-  setMode(m);
-  if(m==='SINGLE'){
-    $('#singleAirport').value=(current.map&&current.map.airport)||'';
-  } else {
-    buildLedTable(current.length,(current.map&&current.map.leds)||[],true);
+// Function to stop LED identification
+async function stopLedIdentification() {
+  try {
+    const r = await fetch('/api/skyaware/led/stop', { method: 'GET' });
+    if (!r.ok) throw new Error('LED stop failed: '+r.status);
+    
+    ledIdentState.active = false;
+    ledIdentState.ledIndex = null;
+    updateLedIdentUI();
+    
+  } catch (e) {
+    console.error('LED stop error:', e);
   }
 }
 
-function buildLedTable(len,vals,withCat){
-  ledHead.innerHTML = withCat
-    ? "<tr><th style='width:100px'>LED #</th><th>Airport</th><th style='width:130px'>Cat</th></tr>"
-    : "<tr><th style='width:100px'>LED #</th><th>Airport</th></tr>";
-  ledTable.innerHTML='';
-  for(let i=0;i<len;i++){
-    const v=(Array.isArray(vals)&&vals[i])?vals[i]:'-';
-    const tr=document.createElement('tr');
-    tr.innerHTML= withCat
-      ? `<td>${i}</td><td><input type=text data-i='${i}' value='${v}' maxlength=12></td><td class='catCell' data-i='${i}'>-</td>`
-      : `<td>${i}</td><td><input type=text data-i='${i}' value='${v}' maxlength=12></td>`;
-    ledTable.appendChild(tr);
+// Update LED identification UI (button states and banner)
+function updateLedIdentUI() {
+  const buttons = document.querySelectorAll('.btn-led-id');
+  buttons.forEach(btn => {
+    const idx = parseInt(btn.getAttribute('data-led-idx'), 10);
+    if (ledIdentState.active && idx === ledIdentState.ledIndex) {
+      btn.classList.add('active');
+      btn.textContent = '🔵 Identifying...';
+    } else {
+      btn.classList.remove('active');
+      btn.textContent = '🆔 ID';
+    }
+  });
+  
+  // Update banner if it exists
+  const banner = document.querySelector('.led-ident-banner');
+  if (banner) {
+    if (ledIdentState.active) {
+      banner.classList.add('show');
+      banner.innerHTML = `
+        <div class="led-ident-pulse"></div>
+        <div class="grow">
+          <strong>LED ${ledIdentState.ledIndex} → IDENT (Cyan)</strong> — Click <strong>Stop ID</strong> to end
+        </div>
+        <button class="btn btn-id" onclick="stopLedIdentification()" style="min-width:auto">Stop ID</button>
+      `;
+    } else {
+      banner.classList.remove('show');
+    }
   }
 }
 
-// events
-document.addEventListener('change',e=>{if(e.target.name==='mode')setMode(getMode());if(e.target===segSel)selectSeg();});
-$('#saveSingle').addEventListener('click',async()=>{
-  const seg=segSel.value;
-  const ap=($('#singleAirport').value||'').trim().toUpperCase();
-  if(!ap){showMsg('Enter airport code',false);return;}
-  const body=new URLSearchParams({seg,mode:'SINGLE',airport:ap});
-  await fetch('/api/skyaware/map',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
-  showMsg('Saved.');
-  setTimeout(()=>{loadState();loadSegments();},300);
-});
-$('#saveMulti').addEventListener('click',async()=>{
-  const seg=segSel.value;
-  const vals=[...ledTable.querySelectorAll('input[data-i]')].map(i=>{let v=(i.value||'-').trim().toUpperCase();if(!v.length)v='-';return v;});
-  const body=new URLSearchParams({seg,mode:'MULTIPLE',leds:vals.join(',')});
-  await fetch('/api/skyaware/map',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
-  showMsg('Saved.');
-});
-$('#btnRefresh').addEventListener('click',async()=>{
-  await fetch('/api/skyaware/refresh'); showMsg('Fetch queued.');
-  setTimeout(()=>{loadState();},500);
-});
+/*** END LED IDENTIFICATION ***/
 
-// status rendering
-function fillSingleTop(s){
-  $('#catTop').style.display='';
-  applyCatTag($('#catTop'),s.category);
-  const m=s.metar||{};
-  $('#kvAirport').textContent = s.primary || s.airport || '-';
-  $('#kvStation').textContent = m.station||'-';
-  $('#kvTimeZ').textContent   = m.timeZ||'-';
-  $('#kvWind').textContent    = m.wind||'-';
-  $('#kvVis').textContent     = m.vis||'-';
-  $('#kvClouds').textContent  = m.clouds||'-';
-  $('#kvTempDew').textContent = m.tempDew||'-';
-  $('#kvAltim').textContent   = m.altim||'-';
+function loadLS(){
+  try{
+    const s = localStorage.getItem(LSK);
+    if (!s) return;
+    const o = JSON.parse(s);
+    if (o && typeof o==='object'){
+      for (const k of Object.keys(o)) cache[k] = o[k];
+    }
+  }catch{}
+}
+function saveLS(){
+  try{ localStorage.setItem(LSK, JSON.stringify(cache)); }catch{}
 }
 
-function fillMultiTop(s){
-  $('#catTop').style.display='none';
-  $('#kvAirport').textContent='(multiple)';
-  for (const id of ['#kvStation','#kvTimeZ','#kvWind','#kvVis','#kvClouds','#kvTempDew','#kvAltim']) $(id).textContent='—';
+/*** Utils ***/
+function setMsg(t, color){ msg.textContent=t || ''; msg.style.color = color || ''; }
+const upper = s => (s||'').trim().toUpperCase();
 
-  const cats = {};
-  (s.airports||[]).forEach(a=>{ if(a && a.id) cats[a.id.toUpperCase()] = (a.good ? a.cat : 'UNKNOWN'); });
+function colorForCat(cat){
+  switch((cat||'').toUpperCase()){
+    case 'VFR': return '#20c15a';
+    case 'MVFR':return '#3a68ff';
+    case 'IFR': return '#ff4b4b';
+    case 'LIFR':return '#ff3fff';
+    default:    return '#d8dee9';
+  }
+}
+function catClass(cat){
+  return (cat||'unknown').toLowerCase();
+}
+function catDescription(cat){
+  switch((cat||'').toUpperCase()){
+    case 'VFR':  return 'Visual Flight Rules - Ceiling ≥3000ft, Visibility ≥5mi';
+    case 'MVFR': return 'Marginal VFR - Ceiling 1000-3000ft, Visibility 3-5mi';
+    case 'IFR':  return 'Instrument Flight Rules - Ceiling 500-1000ft, Visibility 1-3mi';
+    case 'LIFR': return 'Low IFR - Ceiling <500ft, Visibility <1mi';
+    default:     return 'Unknown or unavailable';
+  }
+}
+function makeChip(cat){
+  if (!cat){ const span=document.createElement('span'); span.textContent='—'; return span; }
+  const el = document.createElement('span');
+  el.className='chip';
+  el.style.background = colorForCat(cat);
+  el.title = cat || 'UNKNOWN';
+  return el;
+}
 
-  ledTable.querySelectorAll('tr').forEach(tr=>{
-    const i = tr.querySelector('input[data-i]');
-    const catCell = tr.querySelector('.catCell');
-    if (!i || !catCell) return;
-    const ap=(i.value||'-').trim().toUpperCase();
-    const cat = (ap==='-' ? '' : (cats[ap]||'UNKNOWN'));
-    catCell.textContent = cat || '-';
-    if (cat) { catCell.className = 'catCell catTag '+cat; } else { catCell.className = 'catCell'; }
+function markUnsaved(){
+  hasUnsavedChanges = true;
+  saveStatus.className = 'save-status unsaved';
+  saveStatus.textContent = '● Unsaved Changes';
+  unsavedWarning.classList.add('show');
+}
+function markSaved(){
+  hasUnsavedChanges = false;
+  saveStatus.className = 'save-status saved';
+  saveStatus.textContent = '✓ Saved to Device';
+  unsavedWarning.classList.remove('show');
+}
+
+function expandShorthandToPerLed(tokens, length){
+  // tokens: array of user inputs line-by-line
+  const out = new Array(length).fill('-');
+  let i = 0;
+  for (let t=0; t<tokens.length && i<length; t++){
+    const raw = (tokens[t]||'').toUpperCase();
+    if (!raw){ out[i]='-'; i++; continue; }
+    const m = raw.match(/^([A-Z0-9\-_]+)(?:\+(\d+))?$/);
+    if (!m){ out[i]='-'; i++; continue; }
+    const id = m[1];
+    const n  = Math.max(1, parseInt(m[2]||'1',10));
+    for(let k=0;k<n && (i+k)<length;k++) out[i+k]=id;
+    i += n;
+  }
+  return out;
+}
+function collectInputsFromTable(){
+  const rows = Array.from(mapBody.querySelectorAll('tr'));
+  return rows.map(tr => (tr.querySelector('input')?.value || '').trim().toUpperCase());
+}
+
+/*** Fetchers ***/
+async function fetchSegments(){
+  const r = await fetch('/api/skyaware/segments');
+  if (!r.ok) throw new Error('/segments '+r.status);
+  const j = await r.json();
+  SEGMENTS = (j && j.segments) ? j.segments : [];
+}
+async function fetchState(){
+  const r = await fetch('/api/skyaware/state');
+  if (!r.ok) throw new Error('/state '+r.status);
+  const j = await r.json();
+  STATE = (j && j.SkyAware) ? j.SkyAware : {};
+  AIRCAT = {};
+  if (STATE.airports && Array.isArray(STATE.airports)){
+    STATE.airports.forEach(ap => { AIRCAT[ap.id] = ap.cat; });
+  }
+}
+
+/*** Cache init (geometry from server; scratch from LS or server map once) ***/
+function seedCacheFromServer(){
+  SEGMENTS.forEach((seg,idx)=>{
+    const len = seg.length|0;
+    if (!cache[idx]){
+      // initial - NOTE: server returns flat structure with mode/airport/leds at segment level
+      const serverMode = seg.mode || 'SINGLE';
+      const singleAp   = seg.airport || (STATE.airport||'');
+      const multiArr   = [];
+      if (serverMode==='MULTIPLE'){
+        const arr = Array.isArray(seg.leds) ? seg.leds : [];
+        for (let i=0;i<len;i++) multiArr[i] = (i<arr.length)? String(arr[i]).toUpperCase() : '-';
+      } else {
+        for (let i=0;i<len;i++) multiArr[i] = '-';
+      }
+      cache[idx] = {mode:serverMode, singleAirport:upper(singleAp||''), multi:multiArr, len, start:seg.start|0, stop:seg.stop|0};
+    }else{
+      // preserve existing edits; refresh geometry; pad/truncate multi
+      cache[idx].len=len; cache[idx].start=seg.start|0; cache[idx].stop=seg.stop|0;
+      if (cache[idx].multi.length!==len){
+        const old = cache[idx].multi;
+        cache[idx].multi = new Array(len).fill('-');
+        for (let i=0;i<Math.min(old.length,len);i++) cache[idx].multi[i]=old[i];
+      }
+      // do NOT overwrite mode/single/multi with server here
+    }
   });
 }
 
-async function loadState(){
-  try{
-    const j=await fetch('/api/skyaware/state').then(r=>r.json());
-    const s=j.SkyAware||{};
-    // diag
-    const n=s.net||{};
-    $('#kvHttp').textContent=(s.http||'')+(n.ok?' (OK)':'');
-    $('#kvDns').textContent=(n.dnsProvider||'-')+(n.dnsFallback?' (fallback)':'');
-    $('#kvTimes').textContent=`dns ${n.dnsMs||0}ms • tcp ${n.tcpMs||0}ms • tls ${n.tlsMs||0}ms • http ${n.httpMs||0}ms`;
-    $('#kvWifi').textContent=`${(s.ssid||'')} @ ${(s.staIP||'-')} RSSI ${(s.rssi||'')}dBm`;
-    $('#kvCounts').textContent=`ok ${s.ok||0} / fail ${s.fail||0} • last ${s.fetchMs||0}ms`;
-    $('#kvUrl').textContent=s.url||'-';
-
-    // Countdown: compute using device scheduler timestamps
-    const enabled = !!s.enabled;
-    if (!enabled) {
-      $('#kvNext').textContent = 'disabled';
-    } else if (s.pendingFetch) {
-      $('#kvNext').textContent = 'queued…';
+/*** Rendering ***/
+function renderStatus(){
+  // Basic status
+  p_enabled.textContent = STATE.enabled ? '✓ Enabled' : '○ Disabled';
+  p_enabled.style.background = STATE.enabled ? 'rgba(47,168,79,.2)' : 'rgba(138,147,166,.2)';
+  p_enabled.style.color = STATE.enabled ? 'var(--ok)' : 'var(--muted)';
+  p_enabled.style.border = STATE.enabled ? '1px solid rgba(47,168,79,.4)' : '1px solid var(--hr)';
+  
+  p_http.textContent    = (STATE.http!=null) ? String(STATE.http) : '—';
+  p_url.textContent     = STATE.url || '—';
+  p_err.textContent     = STATE.err || '';
+  p_lastok.textContent  = (STATE.lastOkSec!=null) ? String(STATE.lastOkSec) : '—';
+  p_period.textContent  = (STATE.periodSec!=null) ? String(STATE.periodSec) : '—';
+  p_retry.textContent   = (STATE.retryIndex!=null) ? String(STATE.retryIndex) : '—';
+  p_wifi.textContent    = `${STATE.ssid||'—'} (${STATE.rssi!=null?STATE.rssi+'dBm':'—'}) • ${STATE.staIP||'—'}`;
+  inpAirport.value      = STATE.airport || '';
+  
+  // Mode badges
+  const isSingle = STATE.mode === 'SINGLE';
+  modeBadgeSingle.classList.toggle('active', isSingle);
+  modeBadgeMulti.classList.toggle('active', !isSingle);
+  
+  if (isSingle) {
+    singleModeInfo.style.display = 'block';
+    multiModeInfo.style.display = 'none';
+    primaryAirport.textContent = STATE.primary || STATE.airport || '—';
+    
+    // Flight category banner
+    const cat = STATE.category || 'UNKNOWN';
+    flightCatBanner.style.display = 'flex';
+    flightCatBanner.className = 'flight-cat-banner ' + catClass(cat);
+    flightCatIcon.className = 'flight-cat-icon ' + catClass(cat);
+    flightCatIcon.textContent = cat.substring(0, 3);
+    flightCatText.textContent = cat;
+    flightCatDesc.textContent = catDescription(cat);
+    
+    // METAR summary
+    if (STATE.metar && STATE.metar.wind) {
+      const parts = [];
+      if (STATE.metar.wind) parts.push(STATE.metar.wind);
+      if (STATE.metar.vis) parts.push(STATE.metar.vis);
+      if (STATE.metar.clouds) parts.push(STATE.metar.clouds.split(' ')[0]);
+      metarSummary.textContent = parts.join(' • ') || '—';
     } else {
-      const nowSec  = Number(s.nowSec||0);
-      const nextSec = Number(s.nextAttemptSec||0);
-      const delta = Math.max(0, nextSec - nowSec);
-      startCountdown(delta);
-      if (s.inRetryWindow) $('#kvNext').textContent += (delta>0 ? ' (retry)' : ' (retrying)');
+      metarSummary.textContent = '—';
     }
-
-    const mode = (s.mode||'SINGLE').toUpperCase();
-    if (mode==='MULTIPLE') fillMultiTop(s); else fillSingleTop(s);
-
-    // If editor is MULTIPLE, re-apply row cats
-    const editorMode = getMode();
-    if (editorMode==='MULTIPLE' && current) fillMultiTop(s);
-  }catch(e){}
+  } else {
+    singleModeInfo.style.display = 'none';
+    multiModeInfo.style.display = 'block';
+    flightCatBanner.style.display = 'none';
+    
+    const wanted = STATE.wanted || [];
+    const count = wanted.length;
+    airportCount.textContent = count === 0 ? 'No airports mapped' : 
+                               count === 1 ? '1 airport' :
+                               `${count} airports`;
+  }
+  
+  // countdown
+  if (tickTimer) { clearInterval(tickTimer); tickTimer=null; }
+  const nowSecReported = (STATE.nowSec!=null) ? STATE.nowSec : Math.floor(Date.now()/1000);
+  let nowS = nowSecReported;
+  let next = STATE.nextAttemptSec||0;
+  function tick(){
+    const delta = (next - nowS);
+    p_eta.textContent = delta>0 ? String(delta) : '0';
+    nowS++;
+  }
+  tick(); tickTimer=setInterval(tick,1000);
 }
 
-loadSegments(); loadState();
-setInterval(loadState,5000);
+function fillSegSelector(){
+  selSeg.innerHTML='';
+  SEGMENTS.forEach((s,idx)=>{
+    const opt=document.createElement('option');
+    opt.value=String(idx);
+    opt.textContent=`Segment ${idx}`;
+    selSeg.appendChild(opt);
+  });
+}
+
+function tdMono(txt){ const td=document.createElement('td'); td.className='mono'; td.textContent=txt; return td; }
+function tdMuted(txt){ const td=document.createElement('td'); td.className='muted small'; td.textContent=txt; return td; }
+
+function renderSegment(segIdx){
+  const seg = SEGMENTS[segIdx]; 
+  const c = cache[segIdx];
+  if (!seg || !c){ 
+    mapBody.innerHTML='<tr><td colspan="6">No segment data</td></tr>'; 
+    return; 
+  }
+  
+  segStart.textContent = String(c.start);
+  segStop.textContent  = String(c.stop);
+  segLen.textContent   = String(c.len);
+  segMode.textContent  = c.mode;
+  selMode.value        = c.mode;
+  
+  mapBody.innerHTML='';
+  if (c.mode==='SINGLE'){
+    // SINGLE mode: show single row (no ID button)
+    const tr=document.createElement('tr');
+    const tdIdx = tdMono('All'); 
+    tr.appendChild(tdIdx);
+    const tdAbs = tdMono(`${c.start}–${c.stop}`); 
+    tr.appendChild(tdAbs);
+    const tdInp = document.createElement('td');
+    const inp = document.createElement('input');
+    inp.type='text'; 
+    inp.className='mono'; 
+    inp.value=c.singleAirport||'';
+    inp.style.width='100%';
+    inp.oninput = () => markUnsaved();
+    tdInp.appendChild(inp);
+    tr.appendChild(tdInp);
+    const ap = upper(c.singleAirport||STATE.airport||'');
+    const tdCat = document.createElement('td');
+    tdCat.appendChild(makeChip(AIRCAT[ap]||'UNKNOWN'));
+    tdCat.appendChild(document.createTextNode((AIRCAT[ap]||'UNKNOWN')));
+    tr.appendChild(tdCat);
+    const tdNote = tdMuted('All LEDs same');
+    tr.appendChild(tdNote);
+    mapBody.appendChild(tr);
+  } else {
+    // MULTIPLE mode: per-LED with ID buttons
+    for (let i=0;i<c.len;i++){
+      const tr=document.createElement('tr');
+      tr.appendChild(tdMono(String(i)));
+      
+      // Absolute LED index cell
+      const tdAbs = tdMono(String(c.start+i));
+      tr.appendChild(tdAbs);
+      
+      // Add ID button
+      const tdBtn = document.createElement('td');
+      tdBtn.style.width = '50px';
+      tdBtn.style.textAlign = 'center';
+      const btnId = document.createElement('button');
+      btnId.className = 'btn btn-id btn-led-id';
+      btnId.setAttribute('data-led-idx', String(c.start+i));
+      btnId.setAttribute('data-seg-idx', String(segIdx));
+      btnId.textContent = '🆔 ID';
+      btnId.style.width = '100%';
+      btnId.onclick = async (e) => {
+        e.preventDefault();
+        ledIdentState.identifyingSegIdx = segIdx;
+        if (ledIdentState.active && ledIdentState.ledIndex === (c.start+i)) {
+          await stopLedIdentification();
+        } else {
+          await stopLedIdentification(); // Stop any current identification
+          await startLedIdentification(c.start+i);
+        }
+      };
+      tdBtn.appendChild(btnId);
+      tr.appendChild(tdBtn);
+      
+      // Airport input
+      const tdInp=document.createElement('td');
+      const inp=document.createElement('input');
+      inp.type='text'; 
+      inp.className='mono'; 
+      inp.value=c.multi[i]||'-';
+      inp.style.width='100%';
+      inp.oninput = () => markUnsaved();
+      tdInp.appendChild(inp);
+      tr.appendChild(tdInp);
+      
+      // Category chip
+      const ap = upper(c.multi[i]||'');
+      const cat = (ap==='-'||ap==='SKIP'||!ap) ? null : (AIRCAT[ap]||'UNKNOWN');
+      const tdCat=document.createElement('td');
+      if (cat){
+        tdCat.appendChild(makeChip(cat));
+        tdCat.appendChild(document.createTextNode(cat));
+      } else {
+        tdCat.appendChild(document.createTextNode('—'));
+      }
+      tr.appendChild(tdCat);
+      
+      // Notes
+      const tdNote=tdMuted('');
+      tr.appendChild(tdNote);
+      mapBody.appendChild(tr);
+    }
+  }
+  
+  // Show LED identification banner only in MULTIPLE mode
+  const banner = document.querySelector('.led-ident-banner');
+  if (c.mode === 'MULTIPLE') {
+    if (!banner) {
+      const newBanner = document.createElement('div');
+      newBanner.className = 'led-ident-banner';
+      mapBody.parentElement.parentElement.appendChild(newBanner);
+    }
+    if (ledIdentState.active && ledIdentState.identifyingSegIdx === segIdx) {
+      updateLedIdentUI();
+    }
+  }
+}
+
+function renderDiag(){
+  d_dnsProv.textContent = (STATE.net && STATE.net.dnsProvider) || '—';
+  d_dnsFb.textContent   = (STATE.net && STATE.net.dnsFallback!=null) ? String(STATE.net.dnsFallback) : '—';
+  d_stage.textContent   = (STATE.net && STATE.net.stage) || '—';
+  d_detail.textContent  = (STATE.net && STATE.net.detail) || '—';
+  d_dnsMs.textContent   = (STATE.net && STATE.net.dnsMs!=null) ? String(STATE.net.dnsMs) : '—';
+  d_tcpMs.textContent   = (STATE.net && STATE.net.tcpMs!=null) ? String(STATE.net.tcpMs) : '—';
+  d_tlsMs.textContent   = (STATE.net && STATE.net.tlsMs!=null) ? String(STATE.net.tlsMs) : '—';
+  d_httpMs.textContent  = (STATE.net && STATE.net.httpMs!=null) ? String(STATE.net.httpMs) : '—';
+  d_http.textContent    = (STATE.net && STATE.net.http!=null) ? String(STATE.net.http) : '—';
+  d_redirect.textContent= (STATE.net && STATE.net.redirect) || '—';
+  d_bytes.textContent   = (STATE.net && STATE.net.bytes!=null) ? String(STATE.net.bytes) : '—';
+  d_url.textContent     = STATE.url || '—';
+  d_ok.textContent      = (STATE.net && STATE.net.ok!=null) ? String(STATE.net.ok) : '—';
+  diagRaw.textContent   = JSON.stringify(STATE, null, 2);
+}
+
+/*** Persist edits strictly to the right scratch ***/
+function persistEditsToCache(segIdx){
+  const seg = SEGMENTS[segIdx]; const c = cache[segIdx]; if(!seg||!c) return;
+  const modeNow = selMode.value;
+  if (modeNow==='SINGLE'){
+    const first = mapBody.querySelector('input');
+    const val = upper(first ? first.value : '');
+    c.singleAirport = val;                 // update SINGLE scratch
+    // do NOT touch c.multi here
+  } else {
+    const inputs = collectInputsFromTable();
+    c.multi = expandShorthandToPerLed(inputs, seg.length); // update MULTIPLE scratch
+    // do NOT touch c.singleAirport here
+  }
+  c.mode = modeNow; // remember last viewed mode
+  saveLS();
+}
+
+/*** Save to device ***/
+async function saveMapping(){
+  const segIdx = parseInt(selSeg.value||'0',10);
+  const seg = SEGMENTS[segIdx]; const c = cache[segIdx];
+  if (!seg || !c){ setMsg('No segment selected', 'var(--danger)'); return; }
+
+  // persist edits locally first
+  persistEditsToCache(segIdx);
+
+  const body = new URLSearchParams();
+  body.set('seg', String(segIdx));
+
+  if (c.mode==='SINGLE'){
+    let ap = c.singleAirport || STATE.airport || '';
+    body.set('mode','SINGLE');
+    body.set('airport', ap);
+  } else {
+    const csv = c.multi.join(',');
+    body.set('mode','MULTIPLE');
+    body.set('leds', csv);
+  }
+
+  setMsg('Saving to device...', 'var(--muted)');
+  const r = await fetch('/api/skyaware/map', {method:'POST', body});
+  if (!r.ok){ setMsg('Save failed: '+r.status, 'var(--danger)'); return; }
+  
+  markSaved();
+  setMsg('✓ Saved to device! Refresh queued.', 'var(--ok)');
+
+  // Refresh server state/segments
+  await Promise.all([fetchSegments(), fetchState()]);
+  seedCacheFromServer();
+  renderSegment(segIdx);
+  renderStatus();
+  renderDiag();
+  
+  setTimeout(() => setMsg('', ''), 3000);
+}
+
+/*** CSV helpers ***/
+function csvFromArray(arr){ return arr.join(','); }
+function arrayFromCsv(text){
+  return text.split(',').map(s => upper(s.replace(/\r?\n/g,''))).map(s => s||'-');
+}
+function downloadText(filename, text){
+  const blob = new Blob([text], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 0);
+}
+function downloadCsv(){
+  const segIdx = parseInt(selSeg.value||'0',10);
+  const seg = SEGMENTS[segIdx]; const c = cache[segIdx];
+  if (!seg || !c){ setMsg('No segment selected', 'var(--danger)'); return; }
+  persistEditsToCache(segIdx);
+
+  if (c.mode==='SINGLE'){
+    // SINGLE: one token shorthand (KPDX+<len>)
+    const ap = c.singleAirport || STATE.airport || '';
+    const token = ap ? `${ap.includes('+')?ap:(ap+'+'+seg.length)}` : '';
+    downloadText(`skyaware-seg${segIdx}-single.csv`, token);
+  } else {
+    // MULTIPLE: per-LED list
+    const arr = c.multi.slice(0, seg.length);
+    downloadText(`skyaware-seg${segIdx}-multi.csv`, csvFromArray(arr));
+  }
+  setMsg('CSV downloaded', 'var(--ok)');
+  setTimeout(() => setMsg('', ''), 2000);
+}
+function uploadCsv(){
+  fileCsv.click();
+}
+fileCsv.addEventListener('change', async ()=>{
+  const segIdx = parseInt(selSeg.value||'0',10);
+  const seg = SEGMENTS[segIdx]; const c = cache[segIdx];
+  if (!seg || !c){ setMsg('No segment selected', 'var(--danger)'); return; }
+  const f = fileCsv.files[0]; if (!f) return;
+  const text = await f.text();
+  const tokens = arrayFromCsv(text).filter(x=>x!=='');
+  if (tokens.length===1){
+    // single token => interpret as SINGLE shorthand (KPDX or KPDX+N)
+    c.singleAirport = tokens[0];
+    c.mode = 'SINGLE';
+    selMode.value = 'SINGLE';
+    markUnsaved();
+    setMsg('✓ CSV loaded (SINGLE mode). Click "Save to Device" to apply.', 'var(--warn)');
+  } else {
+    // multiple tokens => MULTIPLE per-LED
+    c.multi = new Array(seg.length).fill('-');
+    for (let i=0;i<Math.min(tokens.length, seg.length); i++) c.multi[i]=tokens[i];
+    c.mode = 'MULTIPLE';
+    selMode.value='MULTIPLE';
+    markUnsaved();
+    setMsg('✓ CSV loaded (MULTIPLE mode). Click "Save to Device" to apply.', 'var(--warn)');
+  }
+  saveLS();
+  renderSegment(segIdx);
+  fileCsv.value='';
+});
+
+/*** Clear mapping ***/
+function clearMapping(){
+  const segIdx = parseInt(selSeg.value||'0',10);
+  const seg = SEGMENTS[segIdx]; const c = cache[segIdx];
+  if (!seg || !c){ setMsg('No segment selected', 'var(--danger)'); return; }
+
+  if (selMode.value === 'SINGLE'){
+    c.singleAirport = '';
+    markUnsaved();
+    setMsg('Cleared SINGLE mapping. Click "Save to Device" to apply.', 'var(--warn)');
+  } else {
+    c.multi = new Array(seg.length).fill('-');
+    markUnsaved();
+    setMsg(`Cleared MULTIPLE mapping (${seg.length} LEDs). Click "Save to Device" to apply.`, 'var(--warn)');
+  }
+  saveLS();
+  renderSegment(segIdx);
+}
+
+/*** Actions ***/
+async function doRefresh(){ 
+  await fetch('/api/skyaware/refresh'); 
+  setMsg('✓ Refresh queued', 'var(--ok)');
+  setTimeout(() => setMsg('', ''), 2000);
+}
+async function setAirport(){
+  const a = upper(inpAirport.value);
+  if (!a){ setMsg('Enter station ID', 'var(--danger)'); return; }
+  const url = '/api/skyaware/set?airport='+encodeURIComponent(a);
+  const r = await fetch(url);
+  if (!r.ok){ setMsg('Set failed: '+r.status, 'var(--danger)'); return; }
+  setMsg('✓ Default station set to '+a+', refreshing...', 'var(--ok)');
+  await Promise.all([fetchState()]);
+  renderStatus(); renderDiag();
+  setTimeout(() => setMsg('', ''), 3000);
+}
+async function loadStateDiag(){
+  await fetchState();
+  renderStatus();
+  renderDiag();
+  setMsg('State refreshed', 'var(--ok)');
+  setTimeout(() => setMsg('', ''), 2000);
+}
+async function runHttpsTest(){
+  setMsg('Running HTTPS test...', 'var(--muted)');
+  const r = await fetch('/api/skyaware/https_test');
+  if (!r.ok){ setMsg('HTTPS test failed: '+r.status, 'var(--danger)'); return; }
+  const j = await r.json();
+  STATE.url = j.url || STATE.url;
+  STATE.http = (j.http!=null)? j.http : STATE.http;
+  STATE.net = j.net || STATE.net;
+  renderDiag();
+  diagRaw.textContent = JSON.stringify(j, null, 2);
+  setMsg('✓ HTTPS test complete', 'var(--ok)');
+  setTimeout(() => setMsg('', ''), 3000);
+}
+
+/*** Init ***/
+async function init(){
+  loadLS();
+  try{
+    await Promise.all([fetchSegments(), fetchState()]);
+    renderStatus();
+    fillSegSelector();
+    seedCacheFromServer();
+    const firstIdx = (selSeg.options.length>0) ? parseInt(selSeg.options[0].value,10) : 0;
+    selSeg.value = String(firstIdx);
+    renderSegment(firstIdx);
+    renderDiag();
+    markSaved(); // Start in saved state
+    setMsg('');
+  }catch(e){
+    setMsg('Init failed: '+e.message, 'var(--danger)');
+  }
+}
+
+/*** Wiring ***/
+document.getElementById('btnRefresh').onclick = doRefresh;
+document.getElementById('btnSetAp').onclick  = setAirport;
+document.getElementById('btnSave').onclick   = saveMapping;
+document.getElementById('btnLoadState').onclick = loadStateDiag;
+document.getElementById('btnHttpsTest').onclick = runHttpsTest;
+btnCsvDown.onclick = downloadCsv;
+btnCsvUp.onclick   = uploadCsv;
+btnClear.onclick   = clearMapping;
+
+selSeg.onchange = ()=>{
+  // persist previous seg edits, then switch
+  const prev = parseInt(selSeg.getAttribute('data-prev')||'-1',10);
+  if (!isNaN(prev) && prev>=0) persistEditsToCache(prev);
+  const idx = parseInt(selSeg.value||'0',10);
+  renderSegment(idx);
+  selSeg.setAttribute('data-prev', String(idx));
+};
+selMode.onchange = ()=>{
+  // Do NOT mutate the other mode's scratch; just remember the current choice
+  const idx = parseInt(selSeg.value||'0',10);
+  const c = cache[idx]; 
+  if (c){ 
+    c.mode = selMode.value; 
+    saveLS(); 
+    markUnsaved();
+  }
+  renderSegment(idx);
+};
+
+/*** Cleanup on page unload ***/
+window.addEventListener('beforeunload', async () => {
+  if (ledIdentState.active) {
+    await stopLedIdentification();
+  }
+});
+
+init();
 </script>
+</body>
+</html>
 )HTML";

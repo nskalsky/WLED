@@ -18,16 +18,16 @@ extern "C" {
 
 #include "skyaware_html.h"   // UI HTML (PROGMEM)
 
-// Config toggles
+// ======================= Config toggles =======================
 #ifndef SA_FORCE_DNS_ONCE_PER_WINDOW
   #define SA_FORCE_DNS_ONCE_PER_WINDOW 1
 #endif
 
 #ifndef SKYAWARE_LOG_CAP
-  #define SKYAWARE_LOG_CAP (8 * 1024)
+  #define SKYAWARE_LOG_CAP (11 * 1024)
 #endif
 
-// -------- ring log ----------
+// ----------------------- ring log -----------------------------
 struct SA_RingLog {
   static const size_t CAP = SKYAWARE_LOG_CAP;
   char    buf[CAP];
@@ -68,15 +68,13 @@ static void SA_MEMLOGF(const char* fmt, ...) {
   #define USERMOD_ID_SKYAWARE 0x5CA7
 #endif
 
-// ===== Helpers =====
+// ======================= Helpers ==============================
 static inline String upperTrim(String s) { s.trim(); s.toUpperCase(); return s; }
-static inline bool isAlphaNumDash(char c) {
-  return (c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_';
-}
+static inline bool isAlphaNumDash(char c) { return (c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'; }
 static inline bool timeReached(uint32_t t) { return (int32_t)(millis() - t) >= 0; }
 
 // ============================================================
-//                     SkyAware Usermod
+//                     SkyAware Usermod (WLED 0.16.x)
 // ============================================================
 class SkyAwareUsermod : public Usermod {
 public:
@@ -138,6 +136,13 @@ private:
   // per-window DNS forcing
   bool     forcedDnsThisWindow = false;
 
+  // LED identification state (for multi-airport LED identification feature)
+  struct LedIdentifier {
+    bool active = false;
+    uint16_t ledIndex = 0;
+    String originalCategory;
+  } ledIdent;
+
   // per-airport cache
   struct ApCache { String id, cat; bool good=false; unsigned long okMs=0; };
   std::vector<ApCache> apCache;
@@ -179,6 +184,7 @@ private:
     if (cat.equalsIgnoreCase("MVFR"))  return RGBW32(  0,  0,255,0);
     if (cat.equalsIgnoreCase("IFR"))   return RGBW32(255,  0,  0,0);
     if (cat.equalsIgnoreCase("LIFR"))  return RGBW32(255,  0,255,0);
+    if (cat.equalsIgnoreCase("IDENT")) return RGBW32(  0,255,255,0);  // Cyan - unique identifier color
     return RGBW32(255,255,255,0);
   }
 
@@ -193,16 +199,111 @@ private:
     ApCache e; e.id=a; e.cat=cat; e.good=good && !cat.equalsIgnoreCase("UNKNOWN"); e.okMs = e.good ? millis() : 0; apCache.push_back(e);
   }
 
-  // Helper: paint a MULTIPLE segment using segment-local indexing.
-  void paintMultiSegment(Segment& seg, const SegmentMap& sm, const String& fallbackAp) {
-    // Freeze to stop the effect engine from repainting the buffer
-    seg.setOption(SEG_OPTION_FREEZE, true);
+  // ===== LED IDENTIFICATION FEATURE (Multi-Airport Mode) =====
+  // Overlays a blinking LED on top of segment rendering
+  
+// Overlays a cyan pixel at the absolute LED index, independent of mapping.
+void updateLedIdentification() {
+  if (!ledIdent.active) return;
 
-    // Clear any stale data
+  // Simple blink: ~2 Hz (on 3 frames, off 1)
+  bool on = ((millis() >> 8) & 0x03) != 0;
+  if (on) strip.setPixelColor(ledIdent.ledIndex, RGBW32(0,255,255,0)); // cyan
+  else    strip.setPixelColor(ledIdent.ledIndex, 0);
+
+  strip.trigger();
+}
+
+
+void startLedIdentification(uint16_t ledAbsIndex) {
+  if (ledAbsIndex >= strip.getLength()) {
+    SA_DBG("invalid LED index: %u (max %u)\n", ledAbsIndex, strip.getLength() - 1);
+    return;
+  }
+  ledIdent.active   = true;
+  ledIdent.ledIndex = ledAbsIndex;
+  ledIdent.originalCategory = ""; // default; set below if we find an airport
+
+  // Try to find mapped airport (optional: to preserve/restore category nicely)
+  uint16_t numSegs = strip.getSegmentsNum();
+  for (uint16_t si = 0; si < numSegs; ++si) {
+    Segment& seg = strip.getSegment(si);
+    if (ledAbsIndex < seg.start || ledAbsIndex >= seg.stop) continue;
+
+    SegmentMap& sm = segMaps[si];
+    uint16_t ledPosInSeg = ledAbsIndex - seg.start;
+
+    if (sm.mode == MAP_MULTIPLE && ledPosInSeg < sm.perLed.size()) {
+      const LedEntry& le = sm.perLed[ledPosInSeg];
+      if (le.type == LT_ICAO && le.value.length()) {
+        String ap = le.value;
+        ledIdent.originalCategory = getCatForAirport(ap);
+        setCatForAirport(ap, "IDENT", true); // keeps UI chips consistent, but overlay wins
+      }
+    } else if (sm.mode == MAP_SINGLE) {
+      String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
+      ledIdent.originalCategory = getCatForAirport(ap);
+      setCatForAirport(ap, "IDENT", true);
+    }
+    break; // found segment containing the LED
+  }
+
+  // Ensure the cyan overlay is visible right away
+  updateLedIdentification();
+}
+
+
+  void stopLedIdentification() {
+    if (!ledIdent.active) return;
+    
+    // Restore the original category
+    uint16_t numSegs = strip.getSegmentsNum();
+    for (uint16_t si = 0; si < numSegs; ++si) {
+      Segment& seg = strip.getSegment(si);
+      uint16_t start = seg.start, stop = seg.stop;
+      
+      if (ledIdent.ledIndex >= start && ledIdent.ledIndex < stop) {
+        SegmentMap& sm = segMaps[si];
+        uint16_t ledPosInSeg = ledIdent.ledIndex - start;
+        
+        if (sm.mode == MAP_MULTIPLE && ledPosInSeg < sm.perLed.size()) {
+          const LedEntry& le = sm.perLed[ledPosInSeg];
+          if (le.type == LT_ICAO && le.value.length()) {
+            String ap = le.value;
+            setCatForAirport(ap, ledIdent.originalCategory, true);
+            SA_DBG("LED %u stopped: airport %s restored to %s\n", 
+                   ledIdent.ledIndex, ap.c_str(), ledIdent.originalCategory.c_str());
+            break;
+          }
+        } else if (sm.mode == MAP_SINGLE) {
+          String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
+          setCatForAirport(ap, ledIdent.originalCategory, true);
+          SA_DBG("LED %u stopped: airport %s restored to %s\n", 
+                 ledIdent.ledIndex, ap.c_str(), ledIdent.originalCategory.c_str());
+          break;
+        }
+      }
+    }
+    
+    ledIdent.active = false;
+  }
+
+  // ===== END LED IDENTIFICATION =====
+
+  // ---------- segment helpers ----------
+  // Return segment length; if invalid (start>=stop), fall back to the whole strip and signal fallback.
+  static inline uint16_t safeSegLen(const Segment& seg, bool& usedFallback) {
+    if (seg.stop > seg.start) { usedFallback = false; return (uint16_t)(seg.stop - seg.start); }
+    usedFallback = true;
+    return strip.getLength();
+  }
+
+  // Paint MULTIPLE segment using segment-local indexing.
+  void paintMultiSegment(Segment& seg, const SegmentMap& sm, const String& fallbackAp) {
+    seg.setOption(SEG_OPTION_FREEZE, true);
     uint16_t len = (seg.stop > seg.start) ? (seg.stop - seg.start) : 0;
     for (uint16_t i = 0; i < len; i++) seg.setPixelColor(i, 0);
 
-    // Paint per-LED by segment-local index
     for (uint16_t i = 0; i < len; i++) {
       uint32_t col = 0;
       const LedEntry& le = sm.perLed[i];
@@ -212,7 +313,6 @@ private:
       }
       seg.setPixelColor(i, col);
     }
-    // Leave FREEZE on so we keep our pixels
   }
 
   void applyLayoutColors() {
@@ -223,17 +323,14 @@ private:
       Segment& seg = strip.getSegment(si);
       SegmentMap& sm = segMaps[si];
 
-      // Keep segment on; we’ll freeze in MULTIPLE
       seg.setOption(SEG_OPTION_ON, true);
       seg.setMode(FX_MODE_STATIC);
 
       if (sm.mode == MAP_SINGLE) {
-        // SINGLE: unfreeze and use one color
         seg.setOption(SEG_OPTION_FREEZE, false);
         const String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
         seg.setColor(0, colorForCategory(getCatForAirport(ap)));
       } else {
-        // MULTIPLE: ensure vector length and paint via segment-local API
         uint16_t start = seg.start, stop = seg.stop;
         uint16_t len = (stop > start) ? (stop - start) : 0;
         if (sm.perLed.size() != len) segMaps[si].perLed.resize(len);
@@ -316,13 +413,13 @@ private:
       case -7:  return "HTTPC_ERROR_NO_HTTP_SERVER(-7)";
       case -8:  return "HTTPC_ERROR_TOO_LESS_RAM(-8)";
       case -9:  return "HTTPC_ERROR_ENCODING(-9)";
-      case -10: return "HTTPC_ERROR_STREAM_WRITE(-10)";
+      case -10: return "HTTPC_ERROR_STREAM_WRITE(--10)";
       case -11: return "HTTPC_ERROR_READ_TIMEOUT(-11)";
       default:  return String("HTTPClient_ERR(")+code+")";
     }
   }
 
-  // ===== DOH helpers =====
+  // ======================= DOH helpers ========================
   bool dohResolveOnce_IP(const String& host, IPAddress& out, String& provider, uint32_t& tookMs,
                          const char* providerHost, const char* providerIP, const char* pathPrefix,
                          const char* provName)
@@ -372,7 +469,12 @@ private:
     dnsMsOut = millis() - t0; return false;
   }
 
-  bool fetchJsonWithDiag(const String& url, DynamicJsonDocument& doc, bool wantPreview=true) {
+  // NOTE: accepts optional ArduinoJson filter (DeserializationOption::Filter)
+  bool fetchJsonWithDiag(const String& url,
+                         DynamicJsonDocument& doc,
+                         bool wantPreview = true,
+                         const JsonDocument* filter = nullptr)
+  {
     lastDiag.clear();
     lastUrl = url;
     lastErr = ""; lastHttp = 0; lastBodyPreview = "";
@@ -436,7 +538,8 @@ private:
     client.setHandshakeTimeout(10);
   #endif
     HTTPClient http;
-    http.setUserAgent("WLED-SkyAware/0.6 (+esp)");
+    http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36...");
+   // http.setUserAgent("WLED-SkyAware/0.6 (+esp)");
     http.setConnectTimeout(8000);
     http.setReuse(false);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -473,7 +576,11 @@ private:
     { // parse JSON
       WiFiClient& stream = http.getStream();
       if (!wantPreview) lastBodyPreview = "";
-      DeserializationError jerr = deserializeJson(doc, stream);
+
+      DeserializationError jerr = filter
+        ? deserializeJson(doc, stream, DeserializationOption::Filter(*filter))
+        : deserializeJson(doc, stream);
+
       http.end();
       if (jerr) {
         lastDiag.errStage="json"; lastDiag.errDetail = String("ArduinoJson: ") + jerr.c_str();
@@ -488,13 +595,24 @@ private:
     return true;
   }
 
-  // ===== METAR fetchers =====
+  // ======================= METAR fetchers =====================
   bool fetchMetarOnce() {
     if (!WLED_CONNECTED) { lastErr="WiFi not connected"; return false; }
     String primary = getPrimaryAirportForSingle();
     lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + primary;
-    DynamicJsonDocument doc(2048);
-    bool ok = fetchJsonWithDiag(lastUrl, doc, true);
+
+    // Filter for single: station + category + raw METAR fields
+    StaticJsonDocument<256> filter;
+    JsonArray farr = filter.to<JsonArray>();
+    JsonObject any = farr.createNestedObject();
+    any["icaoId"] = true; any["station"] = true; any["station_id"] = true;
+    any["icao"]   = true; any["id"]      = true;
+    any["fltCat"] = true; any["flight_category"] = true; any["fltcat"] = true;
+    any["rawOb"]  = true; any["raw_text"] = true; any["raw"] = true;
+    any["metar"]  = true; any["raw_ob"]   = true; any["metar_text"] = true;
+
+    DynamicJsonDocument doc(1024);
+    bool ok = fetchJsonWithDiag(lastUrl, doc, true, &filter);
     lastHttp = lastDiag.httpCode;
     if (!ok) { failureCount++; return false; }
     if (!doc.is<JsonArray>()) { lastErr="JSON not array"; failureCount++; return false; }
@@ -523,8 +641,17 @@ private:
     for (size_t i=0;i<airports.size();++i) { if (i) ids+=','; ids += airports[i]; }
 
     lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + ids;
-    DynamicJsonDocument doc(4096);
-    bool ok = fetchJsonWithDiag(lastUrl, doc, true);
+
+    // Filter for multi: only station id + category
+    StaticJsonDocument<256> filter;
+    JsonArray farr = filter.to<JsonArray>();
+    JsonObject any = farr.createNestedObject();
+    any["icaoId"] = true; any["station"] = true; any["station_id"] = true;
+    any["icao"]   = true; any["id"]      = true;
+    any["fltCat"] = true; any["flight_category"] = true; any["fltcat"] = true;
+
+    DynamicJsonDocument doc(1024);
+    bool ok = fetchJsonWithDiag(lastUrl, doc, true, &filter);
     lastHttp = lastDiag.httpCode;
     if (!ok) { failureCount++; return false; }
     if (!doc.is<JsonArray>()) { lastErr="JSON not array"; failureCount++; return false; }
@@ -552,7 +679,7 @@ private:
     return true;
   }
 
-  // ===== mapping helpers =====
+  // ======================= mapping helpers ====================
   void gatherAllAirports(std::vector<String>& out) {
     out.clear();
     auto pushUnique=[&](const String& s){
@@ -588,7 +715,6 @@ private:
   }
 
   String getPrimaryAirportForSingle() {
-    // first SINGLE segment’s airport or global fallback
     uint16_t numSegs = strip.getSegmentsNum();
     if (segMaps.size() < numSegs) syncSegMapSize();
     for (uint16_t si=0; si<numSegs; ++si) {
@@ -602,155 +728,174 @@ private:
 
   static const char* modeLabel(MapMode m) { return (m==MAP_SINGLE) ? "SINGLE" : "MULTIPLE"; }
 
-  void writeMappingsJson(JsonArray& arr) {
-    uint16_t numSegs = strip.getSegmentsNum();
-    if (segMaps.size() < numSegs) syncSegMapSize();
-    for (uint16_t si=0; si<numSegs; ++si) {
-      JsonObject s = arr.createNestedObject();
-      s["segment"] = si;
-      s["mode"] = modeLabel(segMaps[si].mode);
-      if (segMaps[si].mode == MAP_SINGLE) {
-        s["airport"] = segMaps[si].wholeAirport;
-      } else {
-        JsonArray leds = s.createNestedArray("leds");
-        for (auto& le : segMaps[si].perLed) {
-          JsonObject o = leds.createNestedObject();
-          o["t"] = (le.type==LT_SKIP ? "SKIP" : (le.type==LT_ICAO ? "ICAO" : "INDICATOR"));
-          o["v"] = le.value;
-        }
-      }
-    }
-  }
+  // ======================= JSON writers =======================
 
+  // Flattened /segments producer (FULL per-LED data). INDICATOR -> "-" ; includes fallback flag.
   void writeSegmentsJson(Print& out) {
-    StaticJsonDocument<4096> d;
-    JsonArray arr = d.createNestedArray("segments");
     uint16_t numSegs = strip.getSegmentsNum();
     if (segMaps.size() < numSegs) syncSegMapSize();
 
+    out.print("{\"segments\":[");
     for (uint16_t si=0; si<numSegs; ++si) {
+      if (si) out.print(",");
       Segment& seg = strip.getSegment(si);
-      uint16_t start = seg.start, stop = seg.stop, len = (stop>start)?(stop-start):0;
+      bool usedFallback=false;
+      uint16_t len = safeSegLen(seg, usedFallback);
 
-      JsonObject s = arr.createNestedObject();
-      s["index"]  = si;
-      s["start"]  = start;
-      s["stop"]   = stop;
-      s["length"] = len;
+      out.print("{\"index\":");   out.print(si);
+      out.print(",\"length\":");  out.print(len);
+      out.print(",\"mode\":\"");  out.print(modeLabel(segMaps[si].mode)); out.print("\"");
+      out.print(",\"fallback\":"); out.print(usedFallback ? "true":"false");
 
-      JsonObject m = s.createNestedObject("map");
       SegmentMap& sm = segMaps[si];
-      m["mode"] = modeLabel(sm.mode);
 
       if (sm.mode == MAP_SINGLE) {
+        // Provide airport-only for SINGLE; editor can convert to MULTIPLE if needed.
         String ap = sm.wholeAirport.length()? sm.wholeAirport : airportId;
-        m["airport"] = ap;
+        out.print(",\"airport\":\""); out.print(ap); out.print("\"");
       } else {
-        if (sm.perLed.size()!=len) sm.perLed.resize(len);
-        JsonArray leds = m.createNestedArray("leds");
+        // MULTIPLE: ensure vector length & emit per-LED list
+        if (sm.perLed.size() != len) segMaps[si].perLed.resize(len);
+        out.print(",\"leds\":[");
         for (uint16_t i=0;i<len;i++) {
+          if (i) out.print(",");
           const LedEntry& le = sm.perLed[i];
-          if (le.type==LT_SKIP) leds.add("-");
-          else if (le.type==LT_ICAO) leds.add(le.value);
-          else { String v="IND:"; v+=le.value; leds.add(v); }
+          if (le.type == LT_ICAO) { out.print("\""); out.print(le.value); out.print("\""); }
+          else { out.print("\"-\""); } // SKIP or INDICATOR => "-"
         }
+        out.print("]");
       }
+
+      out.print("}");
     }
-    serializeJson(d, out);
+    out.print("]}");
   }
 
-  void writeAirportsJson(JsonArray& arr) {
-    for (auto& e : apCache) {
-      JsonObject a = arr.createNestedObject();
-      a["id"]  = e.id;
-      a["cat"] = e.cat;
-      a["good"]= e.good;
-      a["okSec"] = (int)(e.okMs/1000);
+  // Summary-only mapping info for /state (no per-LED arrays).
+  void writeMappingsSummaryJson(Print& out) {
+    uint16_t numSegs = strip.getSegmentsNum();
+    if (segMaps.size() < numSegs) syncSegMapSize();
+
+    out.print("[");
+    for (uint16_t si=0; si<numSegs; ++si) {
+      if (si) out.print(",");
+      Segment& seg = strip.getSegment(si);
+      bool usedFallback=false;
+      uint16_t len = safeSegLen(seg, usedFallback);
+
+      out.print("{\"segment\":");   out.print(si);
+      out.print(",\"mode\":\"");    out.print(modeLabel(segMaps[si].mode)); out.print("\"");
+      out.print(",\"length\":");    out.print(len);
+      out.print(",\"fallback\":");  out.print(usedFallback ? "true":"false");
+      out.print("}");
     }
+    out.print("]");
   }
 
-  void writeDiagJson(JsonObject& d) {
-    d["host"] = lastDiag.host;
-    d["ip"]   = lastDiag.ip;
-    d["http"] = lastDiag.httpCode;
-    d["redirect"] = lastDiag.redirect;
-    d["dnsMs"]  = (int)lastDiag.dnsMs;
-    d["tcpMs"]  = (int)lastDiag.tcpMs;
-    d["tlsMs"]  = (int)lastDiag.tlsMs;
-    d["httpMs"] = (int)lastDiag.httpMs;
-    d["bytes"]  = lastDiag.bytes;
-    d["ok"]     = lastDiag.ok;
-    d["stage"]  = lastDiag.errStage;
-    d["detail"] = lastDiag.errDetail;
-    d["dnsProvider"] = lastDiag.dnsProvider;
-    d["dnsFallback"] = lastDiag.dnsFallbackUsed;
-  }
-
+  // Streamed /state writer (debug + summary only)
   void writeStateJson(Print& out) {
-    StaticJsonDocument<4096> d;
-    JsonObject s = d.createNestedObject("SkyAware");
-    s["enabled"]      = enabled;
-    s["autoBoot"]     = autoFetchBoot;
-    s["airport"]      = airportId;
-    s["category"]     = lastCat;
-    s["interval"]     = updateInterval;
-    s["http"]         = lastHttp;
-    s["err"]          = lastErr;
-    s["url"]          = lastUrl;
-    s["bodyPrev"]     = lastBodyPreview;
-    s["lastOkSec"]    = (int)(lastOkMs/1000);
-    s["fetchMs"]      = (int)lastFetchDurMs;
-    s["ok"]           = successCount;
-    s["fail"]         = failureCount;
-    s["bootWaitMs"]   = (int)BOOT_WIFI_SETTLE_MS;
-    s["pendingFetch"] = (bool)refreshNow;
+    out.print("{\"SkyAware\":{");
 
-    // NEW: scheduler fields for countdown
-    s["nowSec"]        = (int)(millis()/1000);
-    s["nextAttemptSec"]= (int)(nextAttemptAt/1000);
-    s["windowEndSec"]  = (int)(windowDeadline/1000);
-    s["periodSec"]     = (int)(periodMs()/1000);
-    s["retryIndex"]    = (int)retryIndex;
-    s["inRetryWindow"] = (bool)inRetryWindow;
+    out.print("\"enabled\":");      out.print(enabled ? "true":"false");
+    out.print(",\"autoBoot\":");    out.print(autoFetchBoot ? "true":"false");
+    out.print(",\"airport\":\"");   out.print(airportId); out.print("\"");
+    out.print(",\"category\":\"");  out.print(lastCat); out.print("\"");
+    out.print(",\"interval\":");    out.print(updateInterval);
+    out.print(",\"http\":");        out.print(lastHttp);
+    out.print(",\"err\":\"");       out.print(lastErr); out.print("\"");
+    out.print(",\"url\":\"");       out.print(lastUrl); out.print("\"");
+    out.print(",\"bodyPrev\":\"");  out.print(lastBodyPreview); out.print("\"");
+    out.print(",\"lastOkSec\":");   out.print((int)(lastOkMs/1000));
+    out.print(",\"fetchMs\":");     out.print((int)lastFetchDurMs);
+    out.print(",\"ok\":");          out.print(successCount);
+    out.print(",\"fail\":");        out.print(failureCount);
+    out.print(",\"bootWaitMs\":");  out.print((int)BOOT_WIFI_SETTLE_MS);
+    out.print(",\"pendingFetch\":");out.print(refreshNow ? "true":"false");
 
-    // Mode summary + primary
+    // scheduler
+    out.print(",\"nowSec\":");         out.print((int)(millis()/1000));
+    out.print(",\"nextAttemptSec\":"); out.print((int)(nextAttemptAt/1000));
+    out.print(",\"windowEndSec\":");   out.print((int)(windowDeadline/1000));
+    out.print(",\"periodSec\":");      out.print((int)(periodMs()/1000));
+    out.print(",\"retryIndex\":");     out.print((int)retryIndex);
+    out.print(",\"inRetryWindow\":");  out.print(inRetryWindow ? "true":"false");
+
+    // mode + primary
     bool anySingle=false, anyMultiple=false;
     {
       uint16_t numSegs = strip.getSegmentsNum();
-      if (segMaps.size() < numSegs) const_cast<SkyAwareUsermod*>(this)->syncSegMapSize();
+      if (segMaps.size() < numSegs) syncSegMapSize();
       for (uint16_t si=0; si<numSegs; ++si) ((segMaps[si].mode==MAP_SINGLE)? anySingle: anyMultiple)=true;
     }
-    const char* modeSumm = anyMultiple ? "MULTIPLE" : "SINGLE";
-    s["mode"] = modeSumm;
-    s["primary"] = anyMultiple ? "" : getPrimaryAirportForSingle();
+    out.print(",\"mode\":\""); out.print(anyMultiple ? "MULTIPLE" : "SINGLE"); out.print("\"");
+    out.print(",\"primary\":\""); out.print(anyMultiple ? "" : getPrimaryAirportForSingle()); out.print("\"");
 
-    // wanted airports per mapping
+    // wanted (airports)
     {
       std::vector<String> aps; gatherAllAirports(aps);
-      JsonArray want = s.createNestedArray("wanted");
-      for (auto& id: aps) want.add(id);
+      out.print(",\"wanted\":[");
+      for (size_t i=0;i<aps.size();++i){ if(i) out.print(","); out.print("\""); out.print(aps[i]); out.print("\""); }
+      out.print("]");
     }
 
-    // WiFi quick info (for UI convenience)
-    s["ssid"]  = WiFi.SSID();
-    s["rssi"]  = WiFi.RSSI();
-    s["staIP"] = WiFi.localIP().toString();
+    // WiFi info
+    out.print(",\"ssid\":\""); out.print(WiFi.SSID()); out.print("\"");
+    out.print(",\"rssi\":");   out.print(WiFi.RSSI());
+    out.print(",\"staIP\":\"");out.print(WiFi.localIP().toString()); out.print("\"");
 
-    // METAR (single-primary oriented; MULTIPLE view ignores details)
-    s["metarRaw"] = lastMetarRaw;
-    JsonObject mp = s.createNestedObject("metar");
-    mp["station"] = metarStation; mp["timeZ"] = metarTimeZ; mp["wind"] = metarWind;
-    mp["vis"] = metarVis; mp["clouds"]=metarClouds; mp["tempDew"]=metarTempDew;
-    mp["altim"]=metarAltim; mp["wx"]=metarWx; mp["remarks"]=metarRemarks;
+    // METAR detail (single-primary view)
+    out.print(",\"metarRaw\":\""); out.print(lastMetarRaw); out.print("\"");
+    out.print(",\"metar\":{");
+    out.print("\"station\":\""); out.print(metarStation); out.print("\"");
+    out.print(",\"timeZ\":\"");  out.print(metarTimeZ);   out.print("\"");
+    out.print(",\"wind\":\"");   out.print(metarWind);    out.print("\"");
+    out.print(",\"vis\":\"");    out.print(metarVis);     out.print("\"");
+    out.print(",\"clouds\":\""); out.print(metarClouds);  out.print("\"");
+    out.print(",\"tempDew\":\"");out.print(metarTempDew); out.print("\"");
+    out.print(",\"altim\":\"");  out.print(metarAltim);   out.print("\"");
+    out.print(",\"wx\":\"");     out.print(metarWx);      out.print("\"");
+    out.print(",\"remarks\":\"");out.print(metarRemarks); out.print("\"");
+    out.print("}");
 
-    // mappings + cached airports + diag
-    JsonArray mj = s.createNestedArray("mappings"); writeMappingsJson(mj);
-    JsonArray aj = s.createNestedArray("airports"); writeAirportsJson(aj);
-    JsonObject nd = s.createNestedObject("net"); writeDiagJson(nd);
+    // mappings summary only (no per-LEDs)
+    out.print(",\"mappings\":");
+    writeMappingsSummaryJson(out);
 
-    serializeJson(d, out);
+    // airports cache
+    out.print(",\"airports\":[");
+    for (size_t i=0;i<apCache.size();++i) {
+      if (i) out.print(",");
+      auto& e = apCache[i];
+      out.print("{\"id\":\""); out.print(e.id); out.print("\"");
+      out.print(",\"cat\":\""); out.print(e.cat); out.print("\"");
+      out.print(",\"good\":"); out.print(e.good ? "true":"false");
+      out.print(",\"okSec\":"); out.print((int)(e.okMs/1000));
+      out.print("}");
+    }
+    out.print("]");
+
+    // net diag
+    out.print(",\"net\":{");
+    out.print("\"host\":\""); out.print(lastDiag.host); out.print("\"");
+    out.print(",\"ip\":\"");  out.print(lastDiag.ip);   out.print("\"");
+    out.print(",\"http\":");  out.print(lastDiag.httpCode);
+    out.print(",\"redirect\":\""); out.print(lastDiag.redirect); out.print("\"");
+    out.print(",\"dnsMs\":"); out.print((int)lastDiag.dnsMs);
+    out.print(",\"tcpMs\":"); out.print((int)lastDiag.tcpMs);
+    out.print(",\"tlsMs\":"); out.print((int)lastDiag.tlsMs);
+    out.print(",\"httpMs\":");out.print((int)lastDiag.httpMs);
+    out.print(",\"bytes\":"); out.print(lastDiag.bytes);
+    out.print(",\"ok\":");    out.print(lastDiag.ok ? "true":"false");
+    out.print(",\"stage\":\"");  out.print(lastDiag.errStage);  out.print("\"");
+    out.print(",\"detail\":\""); out.print(lastDiag.errDetail); out.print("\"");
+    out.print(",\"dnsProvider\":\""); out.print(lastDiag.dnsProvider); out.print("\"");
+    out.print(",\"dnsFallback\":"); out.print(lastDiag.dnsFallbackUsed ? "true":"false");
+    out.print("}");
+
+    out.print("}}");
   }
 
+  // ======================= config I/O =========================
   void syncSegMapSize() {
     uint16_t numSegs = strip.getSegmentsNum();
     if (segMaps.size() == numSegs) return;
@@ -760,13 +905,15 @@ private:
       segMaps[i].mode = MAP_SINGLE;
       segMaps[i].wholeAirport = airportId;
       segMaps[i].perLed.clear();
+      // Note: perLed will be resized lazily where needed; no heavy allocations here
     }
   }
 
   void parseLedCsv(uint16_t segIndex, const String& csv) {
     syncSegMapSize();
     Segment& seg = strip.getSegment(segIndex);
-    uint16_t len = (seg.stop>seg.start)?(seg.stop-seg.start):0;
+    bool fb=false;
+    uint16_t len = safeSegLen(seg, fb);
 
     segMaps[segIndex].mode = MAP_MULTIPLE;
     segMaps[segIndex].perLed.clear();
@@ -780,7 +927,8 @@ private:
       if (tok.length()==0 || tok=="-" || tok.equalsIgnoreCase("SKIP")) {
         le.type = LT_SKIP;
       } else if (tok.startsWith("IND:")) {
-        le.type = LT_INDICATOR; le.value = tok.substring(4);
+        // per your choice: treat INDICATOR as SKIP for now
+        le.type = LT_SKIP; le.value="";
       } else {
         String ap = upperTrim(tok);
         bool ok=true;
@@ -793,14 +941,8 @@ private:
     }
   }
 
-  void triggerImmediateFetch(const char* why) {
-    SA_DBG("immediate fetch queued (%s)\n", why ? why : "n/a");
-    refreshNow = true;
-    initOrRealignSchedule(true);
-  }
-
+  // ======================= core hooks =========================
 public:
-  // ---------- core hooks ----------
   void setup() override {
     SA_DBG("setup: airport=%s, interval=%u min, enabled=%d, autoFetch=%d\n",
            airportId.c_str(), updateInterval, (int)enabled, (int)autoFetchBoot);
@@ -810,7 +952,7 @@ public:
 
     extern AsyncWebServer server;
 
-    // ===== UI =====
+    // ===== UI static page =====
     server.on("/skyaware", HTTP_GET, [](AsyncWebServerRequest* r){
       size_t htmlLen = strlen_P((PGM_P)SKY_UI_HTML);
       AsyncWebServerResponse* res = r->beginResponse_P(
@@ -821,7 +963,7 @@ public:
       r->send(res);
     });
 
-    // ===== API (logical under /api/skyaware/* ) =====
+    // ===== API =====
     server.on("/api/skyaware/enable", HTTP_GET, [this](AsyncWebServerRequest* r){
       bool on = r->hasParam("on") && (r->getParam("on")->value() == "1");
       enabled = on; r->send(200, "text/plain", enabled ? "SkyAware: enabled" : "SkyAware: disabled");
@@ -840,15 +982,20 @@ public:
         airportId = a;
         syncSegMapSize();
         for (auto& sm : segMaps) if (sm.mode==MAP_SINGLE && !sm.wholeAirport.length()) sm.wholeAirport=a;
-        triggerImmediateFetch("/api/skyaware/set");
+          refreshNow = true;
+          initOrRealignSchedule(true);
       }
       r->send(200, "text/plain", airportId);
     });
 
-    // Geometry + mapping
+    // Geometry + mapping (FLATTENED with full per-LED list)
     server.on("/api/skyaware/segments", HTTP_GET, [this](AsyncWebServerRequest* r){
-      AsyncResponseStream* res = r->beginResponseStream("application/json"); writeSegmentsJson(*res); r->send(res);
+      AsyncResponseStream* res = r->beginResponseStream("application/json");
+      writeSegmentsJson(*res);
+      r->send(res);
     });
+
+    // /map accepts MULTIPLE CSV or SINGLE with airport
     server.on("/api/skyaware/map", HTTP_POST, [this](AsyncWebServerRequest* r){
       auto bad=[&](const char* m){ r->send(400,"text/plain",m); };
       if (!r->hasParam("seg", true)) { bad("missing seg"); return; }
@@ -864,7 +1011,9 @@ public:
         String csv = r->hasParam("leds", true) ? r->getParam("leds", true)->value() : "";
         parseLedCsv(segIdx, csv);
       } else { bad("mode must be SINGLE or MULTIPLE"); return; }
-      triggerImmediateFetch("map update"); r->send(200,"text/plain","OK");
+      refreshNow = true;
+      initOrRealignSchedule(true); 
+      r->send(200,"text/plain","OK");
     });
 
     // HTTPS probe + state + log
@@ -872,17 +1021,31 @@ public:
       std::vector<String> aps; gatherAllAirports(aps);
       String ids; for (size_t i=0;i<aps.size();++i){ if(i) ids+=','; ids+=aps[i]; }
       String url = "https://aviationweather.gov/api/data/metar?format=json&ids=" + (ids.length()?ids:getPrimaryAirportForSingle());
+      StaticJsonDocument<256> filter;
+      JsonArray farr = filter.to<JsonArray>();
+      JsonObject any = farr.createNestedObject();
+      any["icaoId"]=true; any["station"]=true; any["station_id"]=true;
+      any["icao"]=true;   any["id"]=true;
+      any["fltCat"]=true; any["flight_category"]=true; any["fltcat"]=true;
+
       DynamicJsonDocument tmp(256);
-      bool ok = fetchJsonWithDiag(url, tmp, true);
+      bool ok = fetchJsonWithDiag(url, tmp, true, &filter);
       StaticJsonDocument<512> d; JsonObject o = d.to<JsonObject>();
       o["ok"]  = ok; o["err"] = lastErr; o["http"] = lastHttp; o["url"] = lastUrl;
-      JsonObject nd = o.createNestedObject("net"); writeDiagJson(nd);
+      JsonObject nd = o.createNestedObject("net");
+      nd["host"] = lastDiag.host; nd["ip"]=lastDiag.ip; nd["http"]=lastDiag.httpCode;
+      nd["redirect"]=lastDiag.redirect; nd["dnsMs"]=(int)lastDiag.dnsMs; nd["tcpMs"]=(int)lastDiag.tcpMs;
+      nd["tlsMs"]=(int)lastDiag.tlsMs; nd["httpMs"]=(int)lastDiag.httpMs; nd["bytes"]=lastDiag.bytes;
+      nd["ok"]=lastDiag.ok; nd["stage"]=lastDiag.errStage; nd["detail"]=lastDiag.errDetail;
+      nd["dnsProvider"]=lastDiag.dnsProvider; nd["dnsFallback"]=lastDiag.dnsFallbackUsed;
       o["bodyPrev"] = lastBodyPreview;
       AsyncResponseStream* res = r->beginResponseStream("application/json"); serializeJson(d, *res); r->send(res);
     });
 
     server.on("/api/skyaware/state", HTTP_GET, [this](AsyncWebServerRequest* r){
-      AsyncResponseStream* res = r->beginResponseStream("application/json"); writeStateJson(*res); r->send(res);
+      AsyncResponseStream* res = r->beginResponseStream("application/json");
+      writeStateJson(*res);
+      r->send(res);
     });
 
     server.on("/api/skyaware/log", HTTP_GET, [](AsyncWebServerRequest* r){
@@ -890,7 +1053,61 @@ public:
     });
     server.on("/api/skyaware/log/clear", HTTP_GET, [](AsyncWebServerRequest* r){ SA_LOGBUF.clear(); r->send(200,"text/plain","SkyAware log cleared"); });
 
-    // ===== Back-compat redirects from old /um/skyaware/* =====
+    // ===== LED IDENTIFICATION ENDPOINTS =====
+    
+    // LED identification endpoint - SIMPLE GET based to avoid POST issues
+  server.on("/api/skyaware/led/identify", HTTP_GET, [this](AsyncWebServerRequest* r){
+  if (!r->hasParam("idx")) { r->send(400, "application/json", "{\"error\":\"missing idx parameter\"}"); return; }
+  uint16_t idx = (uint16_t) strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
+  SA_DBG("LED identify GET request: idx=%u\n", idx);
+  startLedIdentification(idx);
+  applyLayoutColors();      // paint normal mapping
+  updateLedIdentification(); // then overlay cyan at absolute index
+  r->send(200, "application/json", "{\"status\":\"identifying\",\"led\":" + String(idx) + "}");
+});
+
+
+    // Cancel LED identification endpoint
+    server.on("/api/skyaware/led/stop", HTTP_GET, [this](AsyncWebServerRequest* r){
+      SA_DBG("LED identify STOP request\n");
+      stopLedIdentification();
+      applyLayoutColors();  // Apply immediately!
+      r->send(200, "application/json", "{\"status\":\"stopped\"}");
+    });
+
+    // ===== END LED IDENTIFICATION ENDPOINTS =====
+
+    // Simple LED test - cycle through each LED by temporarily setting its airport to IDENT
+    server.on("/api/skyaware/led/test", HTTP_GET, [this](AsyncWebServerRequest* r){
+      uint16_t total = strip.getLength();
+      SA_DBG("LED test starting: %u LEDs\n", total);
+      
+      bool wasEnabled = enabled;
+      enabled = false;
+      
+      // Cycle through each LED
+      for (uint16_t i = 0; i < total; i++) {
+        // Set a dummy airport to IDENT (cyan) for this test
+        setCatForAirport("TEST", "IDENT", true);
+        applyLayoutColors();  // This WORKS - we know it does
+        delay(300);
+        
+        // Clear it
+        setCatForAirport("TEST", "UNKNOWN", true);
+        applyLayoutColors();
+        delay(50);
+      }
+      
+      // Restore
+      enabled = wasEnabled;
+      if (enabled) {
+        applyLayoutColors();
+      }
+      
+      r->send(200, "application/json", "{\"status\":\"test_complete\",\"leds\":" + String(total) + "}");
+    });
+
+    // Back-compat redirects
     auto redir=[&](AsyncWebServerRequest* r, const char* to){
       auto* resp=r->beginResponse(302,"text/plain",to); resp->addHeader("Location",to); r->send(resp);
     };
@@ -915,6 +1132,7 @@ public:
 
   void loop() override {
     static bool firstLoop = true; if (firstLoop) { firstLoop=false; SA_DBG("loop entered\n"); }
+    
     if (busy) return;
 
     // boot settle
@@ -931,7 +1149,11 @@ public:
     const uint32_t period = periodMs();
     if (nextScheduledAt == 0 || prevPeriodMs != period) initOrRealignSchedule(false);
     if (refreshNow) { nextAttemptAt=now; windowDeadline=nextScheduledAt; inRetryWindow=true; retryIndex=0; refreshNow=false; }
-    if (!timeReached(nextAttemptAt)) return;
+    if (!timeReached(nextAttemptAt)) {
+      // Still update LED identification even when not fetching
+      updateLedIdentification();
+      return;
+    }
 
     SA_DBG("attempt (window ends in %lus)\n",
            (unsigned long)((windowDeadline > now) ? ((windowDeadline - now)/1000) : 0));
@@ -943,6 +1165,8 @@ public:
 
     if (ok) {
       applyLayoutColors();
+      // Update LED identification AFTER segment rendering so it overlays on top
+      updateLedIdentification();
       inRetryWindow=false; retryIndex=0; forcedDnsThisWindow=false;
       while (timeReached(nextScheduledAt)) nextScheduledAt += period;
       windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
@@ -958,6 +1182,8 @@ public:
       bool anyGood=false; for (auto& e: apCache) if (e.good) { anyGood=true; break; }
       if (!anyGood) { for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(255,255,255,0)); strip.trigger(); }
       else applyLayoutColors();
+      // Update LED identification AFTER segment rendering
+      updateLedIdentification();
       nextScheduledAt += period; windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
       return;
     }
@@ -985,8 +1211,9 @@ public:
       if (segMaps[si].mode == MAP_SINGLE) {
         m["Airport"] = segMaps[si].wholeAirport;
       } else {
+        // save as CSV for compactness
         Segment& seg = strip.getSegment(si);
-        uint16_t len = (seg.stop>seg.start)?(seg.stop-seg.start):0;
+        uint16_t start = seg.start, stop = seg.stop, len = (stop>start)?(stop-start):0;
         if (segMaps[si].perLed.size()!=len) segMaps[si].perLed.resize(len);
         String csv;
         for (uint16_t i=0;i<len;i++) {
@@ -994,7 +1221,7 @@ public:
           const LedEntry& le = segMaps[si].perLed[i];
           if (le.type==LT_SKIP) csv += "-";
           else if (le.type==LT_ICAO) csv += le.value;
-          else csv += "IND:" + le.value;
+          else csv += "-"; // IND=* stored as "-" for now
         }
         m["CSV"] = csv;
       }
@@ -1039,7 +1266,8 @@ public:
     if (updateInterval != oldInterval) initOrRealignSchedule(false);
     if (!airportId.equals(oldAirport)) {
       SA_DBG("airport change via settings: %s -> %s\n", oldAirport.c_str(), airportId.c_str());
-      triggerImmediateFetch("settings.um airport changed");
+      refreshNow = true;
+      initOrRealignSchedule(true);
     }
 
     SA_DBG("config: enabled=%d, autoBoot=%d, airport=%s, interval=%u (complete=%d)\n",
@@ -1068,7 +1296,12 @@ public:
     std::vector<String> aps; gatherAllAirports(aps);
     for (auto& id : aps) { JsonObject o = a.createNestedObject(); o["id"]=id; o["cat"]=getCatForAirport(id); }
 
-    JsonObject nd = s.createNestedObject("net"); writeDiagJson(nd);
+    JsonObject nd = s.createNestedObject("net");
+    nd["host"]=lastDiag.host; nd["ip"]=lastDiag.ip; nd["http"]=lastDiag.httpCode;
+    nd["redirect"]=lastDiag.redirect; nd["dnsMs"]=(int)lastDiag.dnsMs; nd["tcpMs"]=(int)lastDiag.tcpMs;
+    nd["tlsMs"]=(int)lastDiag.tlsMs; nd["httpMs"]=(int)lastDiag.httpMs; nd["bytes"]=lastDiag.bytes;
+    nd["ok"]=lastDiag.ok; nd["stage"]=lastDiag.errStage; nd["detail"]=lastDiag.errDetail;
+    nd["dnsProvider"]=lastDiag.dnsProvider; nd["dnsFallback"]=lastDiag.dnsFallbackUsed;
   }
 
   uint16_t getId() override { return USERMOD_ID_SKYAWARE; }
