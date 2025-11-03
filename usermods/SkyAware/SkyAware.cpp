@@ -27,6 +27,34 @@ extern "C" {
   #define SKYAWARE_LOG_CAP (11 * 1024)
 #endif
 
+// ---------- SkyAware multi-fetch config & helpers (file-scope) ----------
+namespace {
+  constexpr size_t SKY_MULTI_BATCH   = 12;    // ICAOs per HTTP request
+  constexpr size_t SKY_JSON_DOC_SIZE = 2048;  // ArduinoJson capacity per batch
+
+  // Build the ArduinoJson filter we use for METAR array items
+  static inline void buildMetarFilter(StaticJsonDocument<256>& filter) {
+    JsonArray farr = filter.to<JsonArray>();
+    JsonObject any = farr.createNestedObject();
+    // Station identifiers (endpoint can vary field names)
+    any["icaoId"] = true; any["station"] = true; any["station_id"] = true;
+    any["icao"]   = true; any["id"]      = true;
+    // Flight category variants
+    any["fltCat"] = true; any["flight_category"] = true; any["fltcat"] = true;
+  }
+
+  // Join a slice of airports into a CSV for ?ids=...
+  static inline String joinIdsCsv(const std::vector<String>& airports, size_t start, size_t count) {
+    String ids;
+    for (size_t j = 0; j < count; ++j) {
+      if (j) ids += ',';
+      ids += airports[start + j];
+    }
+    return ids;
+  }
+} // namespace
+
+
 // ----------------------- ring log -----------------------------
 struct SA_RingLog {
   static const size_t CAP = SKYAWARE_LOG_CAP;
@@ -185,7 +213,7 @@ private:
     if (cat.equalsIgnoreCase("IFR"))   return RGBW32(255,  0,  0,0);
     if (cat.equalsIgnoreCase("LIFR"))  return RGBW32(255,  0,255,0);
     if (cat.equalsIgnoreCase("IDENT")) return RGBW32(  0,255,255,0);  // Cyan - unique identifier color
-    return RGBW32(255,255,255,0);
+    return RGBW32(0,0,0,0);
   }
 
   String getCatForAirport(const String& ap) {
@@ -633,51 +661,120 @@ void startLedIdentification(uint16_t ledAbsIndex) {
     return true;
   }
 
-  bool fetchMetarMulti(const std::vector<String>& airports) {
-    if (!WLED_CONNECTED) { lastErr="WiFi not connected"; return false; }
-    if (airports.empty()) return true;
+// Build the ArduinoJson filter we use for METAR array items
+static inline void buildMetarFilter(StaticJsonDocument<256>& filter) {
+  JsonArray farr = filter.to<JsonArray>();
+  JsonObject any = farr.createNestedObject();
+  // Station identifiers (the endpoint can use different field names)
+  any["icaoId"] = true; any["station"] = true; any["station_id"] = true;
+  any["icao"]   = true; any["id"]      = true;
+  // Flight category variants
+  any["fltCat"] = true; any["flight_category"] = true; any["fltcat"] = true;
+}
 
-    String ids;
-    for (size_t i=0;i<airports.size();++i) { if (i) ids+=','; ids += airports[i]; }
+// Join a slice of airports into a CSV for ?ids=...
+static inline String joinIdsCsv(const std::vector<String>& airports, size_t start, size_t count) {
+  String ids;
+  for (size_t j = 0; j < count; ++j) {
+    if (j) ids += ',';
+    ids += airports[start + j];
+  }
+  return ids;
+}
 
-    lastUrl = "https://aviationweather.gov/api/data/metar?format=json&ids=" + ids;
+// ======== Drop-in replacement ========
+bool fetchMetarMulti(const std::vector<String>& airports)
+{
+  // Basic guards
+  if (!WLED_CONNECTED) { lastErr = F("WiFi not connected"); failureCount++; return false; }
+  if (airports.empty()) { lastErr = F("no airports"); return true; }
 
-    // Filter for multi: only station id + category
-    StaticJsonDocument<256> filter;
-    JsonArray farr = filter.to<JsonArray>();
-    JsonObject any = farr.createNestedObject();
-    any["icaoId"] = true; any["station"] = true; any["station_id"] = true;
-    any["icao"]   = true; any["id"]      = true;
-    any["fltCat"] = true; any["flight_category"] = true; any["fltcat"] = true;
+  // Prepare common filter once
+  StaticJsonDocument<256> filter;
+  buildMetarFilter(filter);
 
-    DynamicJsonDocument doc(1024);
-    bool ok = fetchJsonWithDiag(lastUrl, doc, true, &filter);
-    lastHttp = lastDiag.httpCode;
-    if (!ok) { failureCount++; return false; }
-    if (!doc.is<JsonArray>()) { lastErr="JSON not array"; failureCount++; return false; }
+  bool anyOk = false;
+  uint16_t goodObjects = 0, badObjects = 0;
+  const size_t total = airports.size();
+
+  // Process in batches to avoid large JSON docs/URLs
+  for (size_t off = 0; off < total; off += SKY_MULTI_BATCH) {
+    const size_t take = (off + SKY_MULTI_BATCH <= total) ? SKY_MULTI_BATCH : (total - off);
+    const String ids  = joinIdsCsv(airports, off, take);
+
+    lastUrl = F("https://aviationweather.gov/api/data/metar?format=json&ids=");
+    lastUrl += ids;
+
+    // Small and predictable memory per batch
+    DynamicJsonDocument doc(SKY_JSON_DOC_SIZE);
+
+    // Perform request + JSON parse with diagnostics (existing helper)
+    // wantPreview=true keeps timing/diag fields populated
+    bool ok = fetchJsonWithDiag(lastUrl, doc, /*wantPreview=*/true, &filter);
+
+    if (!ok) {
+      // Network/HTTP/parse error—fetchJsonWithDiag filled lastErr/lastHttp/lastDiag
+      SA_DBG("multi: batch off=%u take=%u failed: http=%d err=%s\n",
+             (unsigned)off, (unsigned)take, (int)lastHttp, lastErr.c_str());
+      // Continue to next batch; we still may succeed overall
+      continue;
+    }
+
+    // Expect an array of minimal objects after filter
+    if (!doc.is<JsonArray>()) {
+      lastErr = F("JSON not array (multi)");
+      SA_DBG("multi: batch off=%u take=%u bad shape\n", (unsigned)off, (unsigned)take);
+      continue;
+    }
+
     JsonArray arr = doc.as<JsonArray>();
-    if (arr.isNull()) { lastErr="null array"; failureCount++; return false; }
+    if (arr.isNull()) {
+      lastErr = F("null array (multi)");
+      SA_DBG("multi: batch off=%u take=%u null array\n", (unsigned)off, (unsigned)take);
+      continue;
+    }
 
-    bool anyOk=false;
+    // Walk filtered objects: extract station + category
+    uint16_t batchGood = 0, batchBad = 0;
     for (JsonVariant v : arr) {
       JsonObject o = v.as<JsonObject>();
-      if (o.isNull()) continue;
-      String stn = readStation(o);
-      String cat = readFlightCategory(o);
-      if (stn.length()) {
-        setCatForAirport(stn, cat, true);
-        anyOk = true;
-      }
+      if (o.isNull()) { batchBad++; continue; }
+
+      String stn = readStation(o);          // existing helper in your code
+      String cat = readFlightCategory(o);   // existing helper in your code
+      if (!stn.length()) { batchBad++; continue; }
+
+      setCatForAirport(stn, cat, /*overwrite=*/true);
+      batchGood++;
     }
-    if (anyOk) {
-      String prim = airports[0];
-      lastCat = getCatForAirport(prim);
-      lastMetarRaw = ""; metarStation=metarTimeZ=metarWind=metarVis=metarClouds=metarTempDew=metarAltim=metarWx=metarRemarks="";
-      lastOkMs = millis();
-    } else { lastErr="no stations parsed"; failureCount++; return false; }
+
+    if (batchGood) anyOk = true;
+    goodObjects += batchGood;
+    badObjects  += batchBad;
+
+    SA_DBG("multi: batch off=%u take=%u ok=%u bad=%u\n",
+           (unsigned)off, (unsigned)take, (unsigned)batchGood, (unsigned)batchBad);
+  }
+
+  // Summarize result
+  if (anyOk) {
+    // Pick a primary to mirror single-airport fields (first of original list)
+    lastCat    = getCatForAirport(airports[0]);
+    lastMetarRaw = "";          // we don't keep raw METAR in multi mode
+    lastOkMs   = millis();
     successCount++;
+    SA_DBG("multi: success objects=%u bad=%u\n", (unsigned)goodObjects, (unsigned)badObjects);
     return true;
   }
+
+  failureCount++;
+  // Keep lastErr/lastHttp from the last failed batch; add context
+  if (lastErr.length() == 0) lastErr = F("no batches succeeded");
+  SA_DBG("multi: FAIL (all batches); lastHttp=%d err=%s\n", (int)lastHttp, lastErr.c_str());
+  return false;
+}
+
+
 
   // ======================= mapping helpers ====================
   void gatherAllAirports(std::vector<String>& out) {
@@ -1180,7 +1277,7 @@ public:
     if (timeReached(windowDeadline)) {
       inRetryWindow=false; retryIndex=0; forcedDnsThisWindow=false;
       bool anyGood=false; for (auto& e: apCache) if (e.good) { anyGood=true; break; }
-      if (!anyGood) { for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(255,255,255,0)); strip.trigger(); }
+      if (!anyGood) { for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(0,0,0,0)); strip.trigger(); }
       else applyLayoutColors();
       // Update LED identification AFTER segment rendering
       updateLedIdentification();
