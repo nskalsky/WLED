@@ -24,7 +24,7 @@ extern "C" {
 #endif
 
 #ifndef SKYAWARE_LOG_CAP
-  #define SKYAWARE_LOG_CAP (11 * 1024)
+  #define SKYAWARE_LOG_CAP (9 * 1024)
 #endif
 
 // ---------- SkyAware multi-fetch config & helpers (file-scope) ----------
@@ -227,96 +227,154 @@ private:
     ApCache e; e.id=a; e.cat=cat; e.good=good && !cat.equalsIgnoreCase("UNKNOWN"); e.okMs = e.good ? millis() : 0; apCache.push_back(e);
   }
 
-  // ===== LED IDENTIFICATION FEATURE (Multi-Airport Mode) =====
-  // Overlays a blinking LED on top of segment rendering
-  
-// Overlays a cyan pixel at the absolute LED index, independent of mapping.
-void updateLedIdentification() {
-  if (!ledIdent.active) return;
-
-  // Simple blink: ~2 Hz (on 3 frames, off 1)
-  bool on = ((millis() >> 8) & 0x03) != 0;
-  if (on) strip.setPixelColor(ledIdent.ledIndex, RGBW32(0,255,255,0)); // cyan
-  else    strip.setPixelColor(ledIdent.ledIndex, 0);
-
-  strip.trigger();
-}
-
-
-void startLedIdentification(uint16_t ledAbsIndex) {
-  if (ledAbsIndex >= strip.getLength()) {
-    SA_DBG("invalid LED index: %u (max %u)\n", ledAbsIndex, strip.getLength() - 1);
-    return;
-  }
-  ledIdent.active   = true;
-  ledIdent.ledIndex = ledAbsIndex;
-  ledIdent.originalCategory = ""; // default; set below if we find an airport
-
-  // Try to find mapped airport (optional: to preserve/restore category nicely)
-  uint16_t numSegs = strip.getSegmentsNum();
-  for (uint16_t si = 0; si < numSegs; ++si) {
-    Segment& seg = strip.getSegment(si);
-    if (ledAbsIndex < seg.start || ledAbsIndex >= seg.stop) continue;
-
-    SegmentMap& sm = segMaps[si];
-    uint16_t ledPosInSeg = ledAbsIndex - seg.start;
-
-    if (sm.mode == MAP_MULTIPLE && ledPosInSeg < sm.perLed.size()) {
-      const LedEntry& le = sm.perLed[ledPosInSeg];
-      if (le.type == LT_ICAO && le.value.length()) {
-        String ap = le.value;
-        ledIdent.originalCategory = getCatForAirport(ap);
-        setCatForAirport(ap, "IDENT", true); // keeps UI chips consistent, but overlay wins
-      }
-    } else if (sm.mode == MAP_SINGLE) {
-      String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
-      ledIdent.originalCategory = getCatForAirport(ap);
-      setCatForAirport(ap, "IDENT", true);
+  // ===== LED OVERRIDE SYSTEM (Direct Per-LED Control) =====
+  // This allows arbitrary control of individual LEDs without affecting airport mappings
+  struct LedOverride {
+    uint16_t ledIndex;
+    uint32_t color;
+    unsigned long activeSince;
+    unsigned long duration;  // 0 = indefinite
+    
+    bool isExpired() const {
+      if (duration == 0) return false;
+      return (millis() - activeSince) >= duration;
     }
-    break; // found segment containing the LED
+  };
+  
+  std::vector<LedOverride> ledOverrides;
+  
+  // Add or replace an LED override
+  void setLedOverride(uint16_t ledIndex, uint32_t color, unsigned long durationMs = 0) {
+    if (ledIndex >= strip.getLength()) {
+      SA_DBG("setLedOverride: invalid LED index %u (max %u)\n", 
+             ledIndex, strip.getLength() - 1);
+      return;
+    }
+    
+    // Check if override already exists for this LED
+    for (size_t i = 0; i < ledOverrides.size(); ++i) {
+      if (ledOverrides[i].ledIndex == ledIndex) {
+        // Update existing
+        ledOverrides[i].color = color;
+        ledOverrides[i].activeSince = millis();
+        ledOverrides[i].duration = durationMs;
+        SA_DBG("setLedOverride: updated LED %u to 0x%08x (%lu ms)\n", 
+               ledIndex, color, durationMs);
+        return;
+      }
+    }
+    
+    // Add new override
+    ledOverrides.push_back({
+      ledIndex,
+      color,
+      millis(),
+      durationMs
+    });
+    
+    SA_DBG("setLedOverride: new LED %u set to 0x%08x (%lu ms)\n", 
+           ledIndex, color, durationMs);
   }
-
-  // Ensure the cyan overlay is visible right away
-  updateLedIdentification();
-}
-
-
+  
+  // Remove override for a specific LED
+  void clearLedOverride(uint16_t ledIndex) {
+    for (size_t i = 0; i < ledOverrides.size(); ++i) {
+      if (ledOverrides[i].ledIndex == ledIndex) {
+        SA_DBG("clearLedOverride: LED %u cleared\n", ledIndex);
+        ledOverrides.erase(ledOverrides.begin() + i);
+        return;
+      }
+    }
+  }
+  
+  // Remove all overrides
+  void clearAllLedOverrides() {
+    size_t count = ledOverrides.size();
+    ledOverrides.clear();
+    if (count > 0) {
+      SA_DBG("clearAllLedOverrides: cleared %u overrides\n", count);
+    }
+  }
+  
+  // Apply active LED overrides to the display
+  void applyLedOverrides() {
+    if (ledOverrides.empty()) return;
+    
+    std::vector<size_t> expired;
+    
+    for (size_t i = 0; i < ledOverrides.size(); ++i) {
+      LedOverride& ov = ledOverrides[i];
+      
+      // Check expiration
+      if (ov.isExpired()) {
+        expired.push_back(i);
+        SA_DBG("applyLedOverrides: LED %u expired\n", ov.ledIndex);
+        continue;
+      }
+      
+      // Apply override color
+      strip.setPixelColor(ov.ledIndex, ov.color);
+    }
+    
+    // Remove expired overrides (iterate backwards to preserve indices)
+    for (int i = (int)expired.size() - 1; i >= 0; --i) {
+      ledOverrides.erase(ledOverrides.begin() + expired[i]);
+    }
+    
+    if (!expired.empty()) {
+      SA_DBG("applyLedOverrides: removed %u expired\n", expired.size());
+    }
+  }
+  
+  // New LED identification using override system
+  void startLedIdentification(uint16_t ledIndex, unsigned long durationMs = 30000) {
+    if (ledIndex >= strip.getLength()) {
+      SA_DBG("startLedIdentification: invalid LED index %u (max %u)\n", 
+             ledIndex, strip.getLength() - 1);
+      return;
+    }
+    
+    uint32_t cyanColor = RGBW32(0, 255, 255, 0);
+    setLedOverride(ledIndex, cyanColor, durationMs);
+    
+    ledIdent.active = true;
+    ledIdent.ledIndex = ledIndex;
+    
+    SA_DBG("startLedIdentification: LED %u cyan override (%lu ms)\n", 
+           ledIndex, durationMs);
+  }
+  
+  // Stop identifying a specific LED
   void stopLedIdentification() {
     if (!ledIdent.active) return;
     
-    // Restore the original category
-    uint16_t numSegs = strip.getSegmentsNum();
-    for (uint16_t si = 0; si < numSegs; ++si) {
-      Segment& seg = strip.getSegment(si);
-      uint16_t start = seg.start, stop = seg.stop;
-      
-      if (ledIdent.ledIndex >= start && ledIdent.ledIndex < stop) {
-        SegmentMap& sm = segMaps[si];
-        uint16_t ledPosInSeg = ledIdent.ledIndex - start;
-        
-        if (sm.mode == MAP_MULTIPLE && ledPosInSeg < sm.perLed.size()) {
-          const LedEntry& le = sm.perLed[ledPosInSeg];
-          if (le.type == LT_ICAO && le.value.length()) {
-            String ap = le.value;
-            setCatForAirport(ap, ledIdent.originalCategory, true);
-            SA_DBG("LED %u stopped: airport %s restored to %s\n", 
-                   ledIdent.ledIndex, ap.c_str(), ledIdent.originalCategory.c_str());
-            break;
-          }
-        } else if (sm.mode == MAP_SINGLE) {
-          String ap = sm.wholeAirport.length() ? sm.wholeAirport : airportId;
-          setCatForAirport(ap, ledIdent.originalCategory, true);
-          SA_DBG("LED %u stopped: airport %s restored to %s\n", 
-                 ledIdent.ledIndex, ap.c_str(), ledIdent.originalCategory.c_str());
-          break;
-        }
-      }
+    clearLedOverride(ledIdent.ledIndex);
+    ledIdent.active = false;
+    
+    SA_DBG("stopLedIdentification: stopped LED %u\n", ledIdent.ledIndex);
+  }
+  
+  // Update blinking effect for identified LEDs
+  void updateLedIdentificationBlink() {
+    static unsigned long lastBlink = 0;
+    static bool blinkOn = true;
+    
+    // Toggle every 250ms for ~2Hz effect
+    if (millis() - lastBlink >= 250) {
+      lastBlink = millis();
+      blinkOn = !blinkOn;
     }
     
-    ledIdent.active = false;
+    if (!blinkOn) {
+      // Turn off identified LEDs temporarily
+      for (const auto& ov : ledOverrides) {
+        strip.setPixelColor(ov.ledIndex, 0);
+      }
+      strip.trigger();
+    }
   }
-
-  // ===== END LED IDENTIFICATION =====
+  
+  // ===== END LED OVERRIDE SYSTEM =====
 
   // ---------- segment helpers ----------
   // Return segment length; if invalid (start>=stop), fall back to the whole strip and signal fallback.
@@ -365,7 +423,13 @@ void startLedIdentification(uint16_t ledAbsIndex) {
         paintMultiSegment(seg, sm, airportId);
       }
     }
+
+       // Apply LED overrides AFTER normal rendering
+    applyLedOverrides();
+    
     strip.trigger();
+    
+ 
   }
 
   // ---------- JSON helpers ----------
@@ -1150,29 +1214,125 @@ public:
     });
     server.on("/api/skyaware/log/clear", HTTP_GET, [](AsyncWebServerRequest* r){ SA_LOGBUF.clear(); r->send(200,"text/plain","SkyAware log cleared"); });
 
-    // ===== LED IDENTIFICATION ENDPOINTS =====
+    // ===== LED OVERRIDE ENDPOINTS =====
     
-    // LED identification endpoint - SIMPLE GET based to avoid POST issues
-  server.on("/api/skyaware/led/identify", HTTP_GET, [this](AsyncWebServerRequest* r){
-  if (!r->hasParam("idx")) { r->send(400, "application/json", "{\"error\":\"missing idx parameter\"}"); return; }
-  uint16_t idx = (uint16_t) strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
-  SA_DBG("LED identify GET request: idx=%u\n", idx);
-  startLedIdentification(idx);
-  applyLayoutColors();      // paint normal mapping
-  updateLedIdentification(); // then overlay cyan at absolute index
-  r->send(200, "application/json", "{\"status\":\"identifying\",\"led\":" + String(idx) + "}");
-});
-
-
-    // Cancel LED identification endpoint
-    server.on("/api/skyaware/led/stop", HTTP_GET, [this](AsyncWebServerRequest* r){
-      SA_DBG("LED identify STOP request\n");
-      stopLedIdentification();
-      applyLayoutColors();  // Apply immediately!
-      r->send(200, "application/json", "{\"status\":\"stopped\"}");
+    // Start LED identification with cyan color and optional timeout
+    server.on("/api/skyaware/led/identify", HTTP_GET, [this](AsyncWebServerRequest* r){
+      if (!r->hasParam("idx")) {
+        r->send(400, "application/json", "{\"error\":\"missing idx parameter\"}");
+        return;
+      }
+      
+      uint16_t idx = (uint16_t)strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
+      unsigned long duration = 30000;  // 30s default
+      
+      if (r->hasParam("duration")) {
+        duration = strtoul(r->getParam("duration")->value().c_str(), nullptr, 10);
+      }
+      
+      SA_DBG("API: LED identify - idx=%u, duration=%lu ms\n", idx, duration);
+      startLedIdentification(idx, duration);
+      strip.trigger();
+      
+      r->send(200, "application/json", 
+        "{\"status\":\"identifying\",\"led\":" + String(idx) + 
+        ",\"duration\":" + String(duration) + "}");
     });
-
-    // ===== END LED IDENTIFICATION ENDPOINTS =====
+    
+    // Stop LED identification (clear override)
+    server.on("/api/skyaware/led/stop", HTTP_GET, [this](AsyncWebServerRequest* r){
+      uint16_t idx = ledIdent.active ? ledIdent.ledIndex : 0;
+      if (r->hasParam("idx")) {
+        idx = (uint16_t)strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
+      }
+      
+      SA_DBG("API: LED stop - idx=%u\n", idx);
+      stopLedIdentification();
+      applyLayoutColors();  // Re-render with normal colors
+      
+      r->send(200, "application/json", "{\"status\":\"stopped\",\"led\":" + String(idx) + "}");
+    });
+    
+    // Set arbitrary LED color (new feature)
+    server.on("/api/skyaware/led/setcolor", HTTP_GET, [this](AsyncWebServerRequest* r){
+      if (!r->hasParam("idx") || !r->hasParam("color")) {
+        r->send(400, "application/json", 
+          "{\"error\":\"missing idx or color parameter (format: 0xRRGGBB or 0xRRGGBBWW)\"}");
+        return;
+      }
+      
+      uint16_t idx = (uint16_t)strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
+      uint32_t color = strtoul(r->getParam("color")->value().c_str(), nullptr, 16);
+      unsigned long duration = 0;  // indefinite by default
+      
+      if (r->hasParam("duration")) {
+        duration = strtoul(r->getParam("duration")->value().c_str(), nullptr, 10);
+      }
+      
+      SA_DBG("API: LED setcolor - idx=%u, color=0x%08x, duration=%lu ms\n", 
+             idx, color, duration);
+      
+      setLedOverride(idx, color, duration);
+      strip.trigger();
+      
+      r->send(200, "application/json", 
+        "{\"status\":\"set\",\"led\":" + String(idx) + 
+        ",\"color\":\"0x" + String(color, HEX) + "\"}");
+    });
+    
+    // Clear specific LED override
+    server.on("/api/skyaware/led/clearoverride", HTTP_GET, [this](AsyncWebServerRequest* r){
+      if (!r->hasParam("idx")) {
+        r->send(400, "application/json", "{\"error\":\"missing idx parameter\"}");
+        return;
+      }
+      
+      uint16_t idx = (uint16_t)strtoul(r->getParam("idx")->value().c_str(), nullptr, 10);
+      
+      SA_DBG("API: LED clearoverride - idx=%u\n", idx);
+      clearLedOverride(idx);
+      applyLayoutColors();
+      
+      r->send(200, "application/json", "{\"status\":\"cleared\",\"led\":" + String(idx) + "}");
+    });
+    
+    // Clear all LED overrides
+    server.on("/api/skyaware/led/clearall", HTTP_GET, [this](AsyncWebServerRequest* r){
+      SA_DBG("API: LED clearall\n");
+      clearAllLedOverrides();
+      applyLayoutColors();
+      
+      r->send(200, "application/json", "{\"status\":\"all_cleared\"}");
+    });
+    
+    // Get status of all active LED overrides
+    server.on("/api/skyaware/led/status", HTTP_GET, [this](AsyncWebServerRequest* r){
+      AsyncResponseStream* res = r->beginResponseStream("application/json");
+      
+      res->print("{\"overrides\":[");
+      for (size_t i = 0; i < ledOverrides.size(); ++i) {
+        if (i > 0) res->print(",");
+        const LedOverride& ov = ledOverrides[i];
+        unsigned long remaining = (ov.duration > 0) ? 
+          (ov.duration - (millis() - ov.activeSince)) : 0;
+        res->print("{\"led\":");
+        res->print((int)ov.ledIndex);
+        res->print(",\"color\":\"0x");
+        res->print(String(ov.color, HEX));
+        res->print("\",\"duration\":");
+        res->print((int)ov.duration);
+        res->print(",\"remaining\":");
+        res->print((int)remaining);
+        res->print("}");
+      }
+      res->print("],\"total\":");
+      res->print((int)ledOverrides.size());
+      res->print("}");
+      
+      r->send(res);
+    });
+    
+    // ===== END LED OVERRIDE ENDPOINTS =====
 
     // Simple LED test - cycle through each LED by temporarily setting its airport to IDENT
     server.on("/api/skyaware/led/test", HTTP_GET, [this](AsyncWebServerRequest* r){
@@ -1223,6 +1383,10 @@ public:
     bootFetchPending = autoFetchBoot;
     initOrRealignSchedule(false);
     syncSegMapSize();
+    
+    // Initialize LED override system
+    ledOverrides.clear();
+    SA_DBG("LED override system initialized\n");
 
     SA_DBG("setup done\n");
   }
@@ -1247,8 +1411,8 @@ public:
     if (nextScheduledAt == 0 || prevPeriodMs != period) initOrRealignSchedule(false);
     if (refreshNow) { nextAttemptAt=now; windowDeadline=nextScheduledAt; inRetryWindow=true; retryIndex=0; refreshNow=false; }
     if (!timeReached(nextAttemptAt)) {
-      // Still update LED identification even when not fetching
-      updateLedIdentification();
+      // Still update LED identification blink even when not fetching
+      updateLedIdentificationBlink();
       return;
     }
 
@@ -1262,8 +1426,8 @@ public:
 
     if (ok) {
       applyLayoutColors();
-      // Update LED identification AFTER segment rendering so it overlays on top
-      updateLedIdentification();
+      // Note: LED overrides are now applied inside applyLayoutColors()
+      updateLedIdentificationBlink();
       inRetryWindow=false; retryIndex=0; forcedDnsThisWindow=false;
       while (timeReached(nextScheduledAt)) nextScheduledAt += period;
       windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
@@ -1279,8 +1443,8 @@ public:
       bool anyGood=false; for (auto& e: apCache) if (e.good) { anyGood=true; break; }
       if (!anyGood) { for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(0,0,0,0)); strip.trigger(); }
       else applyLayoutColors();
-      // Update LED identification AFTER segment rendering
-      updateLedIdentification();
+      // Update LED identification blink AFTER segment rendering
+      updateLedIdentificationBlink();
       nextScheduledAt += period; windowDeadline=nextScheduledAt; nextAttemptAt=nextScheduledAt; lastRunMs=now;
       return;
     }

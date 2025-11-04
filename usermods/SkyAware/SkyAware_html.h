@@ -450,77 +450,113 @@ let hasUnsavedChanges = false;
 const cache = {};
 const LSK = 'skyaware-cache-v2';
 
+// ===== GLOBAL LED IDENTIFICATION FUNCTIONS (Must be defined early) =====
+// These are called from onclick handlers and must be available globally
+
+async function startLedIdentification(ledAbsIndex, durationMs = 30000) {
+  if (!ledIdentState) return;
+  return ledIdentState.start(ledAbsIndex, durationMs);
+}
+
+async function stopLedIdentification() {
+  if (!ledIdentState) return;
+  return ledIdentState.stop();
+}
+
+// ===== HELPER FUNCTIONS (called by LED state) =====
+// Refresh UI state after LED changes
+function refreshState() {
+  if (typeof renderStatus === 'function') {
+    renderStatus();
+  }
+  if (typeof renderSegment === 'function') {
+    const segIdx = parseInt(selSeg?.value || 0);
+    renderSegment(segIdx);
+  }
+}
+
+// ===== END GLOBAL FUNCTIONS =====
+
 /*** LED IDENTIFICATION STATE & FUNCTIONS ***/
 
-// Global state for LED identification
-let ledIdentState = {
+const ledIdentState = {
   active: false,
   ledIndex: null,
-  identifyingSegIdx: null
-};
-
-// Function to start LED identification for a specific LED
-async function startLedIdentification(ledAbsIndex) {
-  try {
-    const r = await fetch('/api/skyaware/led/identify?idx=' + ledAbsIndex);
-    if (!r.ok) throw new Error('LED identify failed: '+r.status);
-    
-    ledIdentState.active = true;
-    ledIdentState.ledIndex = ledAbsIndex;
-    updateLedIdentUI();
-    
-  } catch (e) {
-    console.error('LED identification error:', e);
-    setMsg('LED identification failed: '+e.message, 'var(--danger)');
-  }
-}
-
-// Function to stop LED identification
-async function stopLedIdentification() {
-  try {
-    const r = await fetch('/api/skyaware/led/stop', { method: 'GET' });
-    if (!r.ok) throw new Error('LED stop failed: '+r.status);
-    
-    ledIdentState.active = false;
-    ledIdentState.ledIndex = null;
-    updateLedIdentUI();
-    
-  } catch (e) {
-    console.error('LED stop error:', e);
-  }
-}
-
-// Update LED identification UI (button states and banner)
-function updateLedIdentUI() {
-  const buttons = document.querySelectorAll('.btn-led-id');
-  buttons.forEach(btn => {
-    const idx = parseInt(btn.getAttribute('data-led-idx'), 10);
-    if (ledIdentState.active && idx === ledIdentState.ledIndex) {
-      btn.classList.add('active');
-      btn.textContent = '🔵 Identifying...';
-    } else {
-      btn.classList.remove('active');
-      btn.textContent = '🆔 ID';
-    }
-  });
+  identifyingSegIdx: null,
   
-  // Update banner if it exists
-  const banner = document.querySelector('.led-ident-banner');
-  if (banner) {
-    if (ledIdentState.active) {
-      banner.classList.add('show');
-      banner.innerHTML = `
-        <div class="led-ident-pulse"></div>
-        <div class="grow">
-          <strong>LED ${ledIdentState.ledIndex} → IDENT (Cyan)</strong> — Click <strong>Stop ID</strong> to end
-        </div>
-        <button class="btn btn-id" onclick="stopLedIdentification()" style="min-width:auto">Stop ID</button>
-      `;
-    } else {
-      banner.classList.remove('show');
+  async start(ledAbsIndex, durationMs = 30000) {
+    try {
+      const url = `/api/skyaware/led/identify?idx=${ledAbsIndex}&duration=${durationMs}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`LED identify failed: ${r.status}`);
+      
+      const json = await r.json();
+      ledIdentState.active = true;
+      ledIdentState.ledIndex = json.led;
+      console.log(`LED ${json.led} identification started (${json.duration}ms)`);
+      refreshState();
+    } catch (err) {
+      console.error('LED identify error:', err);
+      alert('Error: ' + err.message);
+    }
+  },
+  
+  async stop() {
+    try {
+      const r = await fetch(`/api/skyaware/led/stop`);
+      if (!r.ok) throw new Error(`LED stop failed: ${r.status}`);
+      
+      ledIdentState.active = false;
+      ledIdentState.ledIndex = null;
+      console.log('LED identification stopped');
+      refreshState();
+    } catch (err) {
+      console.error('LED stop error:', err);
+      alert('Error: ' + err.message);
+    }
+  },
+  
+  async setColor(ledIdx, colorHex, durationMs = 0) {
+    try {
+      const url = `/api/skyaware/led/setcolor?idx=${ledIdx}&color=${colorHex}&duration=${durationMs}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`LED setcolor failed: ${r.status}`);
+      
+      const json = await r.json();
+      console.log(`LED ${json.led} set to ${json.color}`);
+      refreshState();
+    } catch (err) {
+      console.error('LED setcolor error:', err);
+      alert('Error: ' + err.message);
+    }
+  },
+  
+  async clearAll() {
+    try {
+      const r = await fetch('/api/skyaware/led/clearall');
+      if (!r.ok) throw new Error(`LED clearall failed: ${r.status}`);
+      
+      ledIdentState.active = false;
+      ledIdentState.ledIndex = null;
+      console.log('All LED overrides cleared');
+      refreshState();
+    } catch (err) {
+      console.error('LED clearall error:', err);
+      alert('Error: ' + err.message);
+    }
+  },
+  
+  async getStatus() {
+    try {
+      const r = await fetch('/api/skyaware/led/status');
+      if (!r.ok) throw new Error(`LED status failed: ${r.status}`);
+      return await r.json();
+    } catch (err) {
+      console.error('LED status error:', err);
+      return { overrides: [], total: 0 };
     }
   }
-}
+};
 
 /*** END LED IDENTIFICATION ***/
 
@@ -848,7 +884,7 @@ function renderSegment(segIdx){
       mapBody.parentElement.parentElement.appendChild(newBanner);
     }
     if (ledIdentState.active && ledIdentState.identifyingSegIdx === segIdx) {
-      updateLedIdentUI();
+      // LED identification UI already handled by refreshState()
     }
   }
 }
