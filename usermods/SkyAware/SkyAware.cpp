@@ -54,6 +54,55 @@ namespace {
   }
 } // namespace
 
+// ---- SkyAware FS + JSON persistence helpers ----
+#ifndef SKY_CFG_DIR
+  #define SKY_CFG_DIR "/skyaware"
+#endif
+#ifndef SKY_CFG_CAP
+  #define SKY_CFG_CAP 16384
+#endif
+
+static bool sa_fsEnsureDir(const char* path) {
+#ifdef WLED_USE_FS
+  if (!WLED_FS.exists(path)) return WLED_FS.mkdir(path);
+  return true;
+#else
+  return false;
+#endif
+}
+
+static constexpr const char* SKY_CFG_FILE = SKY_CFG_DIR "/mapping.json";
+
+static bool saveSkyAwareFile(JsonObject src) {
+#ifdef WLED_USE_FS
+  if (!sa_fsEnsureDir(SKY_CFG_DIR)) return false;
+  File f = WLED_FS.open(SKY_CFG_FILE, "w");
+  if (!f) return false;
+  serializeJson(src, f);
+  f.close();
+  return true;
+#else
+  (void)src;
+  return false;
+#endif
+}
+
+static bool loadSkyAwareFile(JsonDocument& doc) {
+#ifdef WLED_USE_FS
+  if (!WLED_FS.exists(SKY_CFG_FILE)) return false;
+  File f = WLED_FS.open(SKY_CFG_FILE, "r");
+  if (!f) return false;
+  DeserializationError e = deserializeJson(doc, f);
+  f.close();
+  return !e;
+#else
+  (void)doc;
+  return false;
+#endif
+}
+
+
+
 
 // ----------------------- ring log -----------------------------
 struct SA_RingLog {
@@ -62,14 +111,18 @@ struct SA_RingLog {
   size_t  head = 0;
   size_t  size = 0;
   void clear() { head = 0; size = 0; }
-  void push(char c) {
-    buf[(head + size) % CAP] = c;
-    if (size < CAP) size++;
-    else head = (head + 1) % CAP;
+  void write(const char* s, size_t n){
+    for(size_t i=0;i<n;i++){
+      buf[(head + size) % CAP] = s[i];
+      if (size < CAP) size++;
+      else head = (head + 1) % CAP;
+    }
   }
-  void write(const char* s, size_t n) { for (size_t i = 0; i < n; i++) push(s[i]); }
-  void writeStr(const char* s) { write(s, strlen(s)); }
-  void dumpTo(Print& out) { for (size_t i = 0; i < size; i++) out.write(buf[(head + i) % CAP]); }
+  void dumpTo(Print& p) const {
+    for (size_t i=0; i<size; i++){
+      p.print(buf[(head + i) % CAP]);
+    }
+  }
 };
 static SA_RingLog SA_LOGBUF;
 
@@ -107,6 +160,7 @@ static inline bool timeReached(uint32_t t) { return (int32_t)(millis() - t) >= 0
 class SkyAwareUsermod : public Usermod {
 public:
   enum MapMode : uint8_t { MAP_SINGLE = 0, MAP_MULTIPLE = 1 };
+
   enum LedType : uint8_t { LT_SKIP = 0, LT_ICAO = 1, LT_INDICATOR = 2 };
 
   struct LedEntry { LedType type = LT_SKIP; String value; };
@@ -116,6 +170,51 @@ public:
     std::vector<LedEntry> perLed;
   };
 
+  // ---- persistence buffer & helpers ----
+  StaticJsonDocument<SKY_CFG_CAP> _fileDoc;
+  bool saveToFile() {
+    _fileDoc.clear();
+    JsonObject root = _fileDoc.to<JsonObject>();
+    JsonObject top = root.createNestedObject("skyAwareUsermod");
+    top["Enabled"]                = enabled;
+    top["Auto Fetch on Boot"]     = autoFetchBoot;
+    top["Airport ID"]             = airportId;
+    top["Update Frequency (min)"] = updateInterval;
+    JsonArray maps = top.createNestedArray("Mappings");
+    uint16_t numSegs = strip.getSegmentsNum();
+    for (uint16_t si=0; si<numSegs; ++si) {
+      JsonObject m = maps.createNestedObject();
+      m["Segment"] = si;
+      m["Mode"]    = modeLabel(segMaps[si].mode);
+      if (segMaps[si].mode == MAP_SINGLE) {
+        m["Airport"] = segMaps[si].wholeAirport;
+      } else {
+        Segment& seg = strip.getSegment(si);
+        uint16_t start = seg.start, stop = seg.stop;
+        uint16_t len = (stop>start)?(stop-start):0;
+        if (segMaps[si].perLed.size()!=len) segMaps[si].perLed.resize(len);
+        String csv;
+        for (uint16_t i=0;i<len;i++){
+          if (i) csv += ",";
+          const LedEntry& le = segMaps[si].perLed[i];
+          if (le.type==LT_SKIP)      csv += "-";
+          else if (le.type==LT_ICAO) csv += le.value;
+          else                       csv += "-";
+        }
+        m["CSV"] = csv;
+      }
+    }
+    return saveSkyAwareFile(root);
+  }
+  bool loadFromFile() {
+    _fileDoc.clear();
+    if (!loadSkyAwareFile(_fileDoc)) return false;
+    JsonObject root = _fileDoc.as<JsonObject>();
+    return readFromConfig(root);
+  }
+
+  
+  // (duplicate persistence block removed)
 private:
   // persisted base config
   bool     enabled        = false;
@@ -1107,6 +1206,9 @@ public:
   void setup() override {
     SA_DBG("setup: airport=%s, interval=%u min, enabled=%d, autoFetch=%d\n",
            airportId.c_str(), updateInterval, (int)enabled, (int)autoFetchBoot);
+    // attempt to load persisted mapping (if exists)
+    loadFromFile();
+
 
     for (uint16_t i=0;i<strip.getLength();++i) strip.setPixelColor(i, RGBW32(255,255,255,0));
     strip.trigger();
@@ -1174,9 +1276,15 @@ public:
       } else { bad("mode must be SINGLE or MULTIPLE"); return; }
       refreshNow = true;
       initOrRealignSchedule(true); 
-      r->send(200,"text/plain","OK");
-    });
+      {
+        bool ok = saveToFile();
+        AsyncResponseStream* res = r->beginResponseStream("application/json");
+        res->printf("{\"status\":\"ok\",\"saved\":%s,\"seg\":%u,\"mode\":\"%s\"}",
+                    ok?"true":"false", segIdx, modeStr.c_str());
+        r->send(res);
+      }
 
+  });
     // HTTPS probe + state + log
     server.on("/api/skyaware/https_test", HTTP_GET, [this](AsyncWebServerRequest* r){
       std::vector<String> aps; gatherAllAirports(aps);
