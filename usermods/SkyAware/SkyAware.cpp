@@ -3,15 +3,15 @@
 //
 // WHAT'S NEW (adds without removing your Stage 0 features):
 // • In-RAM bounded cache of last-known flight categories per ICAO (with timestamp)
-// • HTTP endpoints to set/read that cache (no METAR fetcher yet), now standardized under /skyaware.api/*:
-//      POST /skyaware.api/cat  -> icao=KHIO&cat=IFR[&ts=1730850000]
+// • HTTP endpoints to set/read that cache (no METAR fetcher yet):
+//      POST /skyaware.api/cat  -> icao=KHIO&cat=IFR[&ts=1730850000]   (mirrors /skyaware/cat for b/c)
 //      GET  /skyaware.api/cat?icao=KHIO
 //      GET  /skyaware.api/cats
 // • /skyaware UI shows read-only L/I/M/V pills per LED row (grey if SKIP/no ICAO)
-// • Preserves ALL of your Stage-0 behaviors: profiles, CSV import/export, own/release, ID button, etc.
+// • **Repaint engine**: whenever categories or mappings change, repaint LEDs & the UI Color column
 //
 // -----------------------------------------------------------------------------
-// - Owns/releases segments (STATIC + FREEZE). Firmware never repaints pixels.
+// - Owns/releases segments (STATIC + FREEZE). Firmware repaints pixels from category cache.
 // - UI at /skyaware: Map Profile dropdown (+ auto-apply for presets), Apply Profile button,
 //   per-LED table (Airport column), ID buttons, CSV import/export.
 // - Preset selected  -> table inputs READ-ONLY (and preset applied immediately).
@@ -23,7 +23,7 @@
 //   * /skyaware/config.json -> { "mapProfile": "Custom" | "<PresetName>" }
 //   * /skyaware/map.json    -> { "map": { "0":"CSV...", "1":"CSV..." } } (for Custom)
 //
-// JSON endpoints live under /skyaware.api/*.
+// JSON endpoints live under /skyaware.api/* (and legacy mirrors under /skyaware/* where noted).
 
 #include "wled.h"
 #include <pgmspace.h>
@@ -57,24 +57,6 @@ static inline SkyCat strToCat(const String& s){
 }
 static inline uint32_t sa_nowSeconds(){ time_t t=time(nullptr); return (t>100000)?(uint32_t)t:(millis()/1000); }
 
-// ---- Category -> color policy (RGB) ----
-static const uint32_t COL_LIFR    = 0xFF3FFF;  // magenta-ish
-static const uint32_t COL_IFR     = 0xFF4B4B;  // red
-static const uint32_t COL_MVFR    = 0x3A68FF;  // blue
-static const uint32_t COL_VFR     = 0x20C15A;  // green
-static const uint32_t COL_UNKNOWN = 0x202020;  // dim gray
-static const uint32_t COL_SKIP    = 0x000000;  // off
-
-static inline uint32_t colorForCat(SkyCat c) {
-  switch (c) {
-    case CAT_LIFR: return COL_LIFR;
-    case CAT_IFR:  return COL_IFR;
-    case CAT_MVFR: return COL_MVFR;
-    case CAT_VFR:  return COL_VFR;
-    default:       return COL_UNKNOWN;
-  }
-}
-
 #ifndef SKY_CAT_CACHE_MAX
   #define SKY_CAT_CACHE_MAX 256
 #endif
@@ -93,6 +75,22 @@ private:
   int evictOldest(){ int b=-1; uint32_t ts=UINT32_MAX; for(int i=0;i<SKY_CAT_CACHE_MAX;i++){ if(rec[i].inUse && rec[i].updated<ts){ b=i; ts=rec[i].updated; } } if(b>=0) rec[b].inUse=false; return (b>=0)?b:0; }
   void writeAt(int idx,const char* icao4,SkyCat cat,uint32_t ts){ if(idx<0||idx>=SKY_CAT_CACHE_MAX||!icao4) return; strncpy(rec[idx].icao,icao4,4); rec[idx].icao[4]='\0'; rec[idx].cat=cat; rec[idx].updated=ts; }
 };
+
+// ================= Color mapping + repaint engine ===========================
+static inline uint32_t colorForCat(SkyCat c){
+  switch(c){
+    case CAT_LIFR: return RGBW32(0xFF,0x3F,0xFF,0x00); // magenta
+    case CAT_IFR:  return RGBW32(0xFF,0x4B,0x4B,0x00); // red
+    case CAT_MVFR: return RGBW32(0x3A,0x68,0xFF,0x00); // blue
+    case CAT_VFR:  return RGBW32(0x20,0xC1,0x5A,0x00); // green
+    default:       return RGBW32(0x40,0x40,0x40,0x00); // dim gray
+  }
+}
+static inline uint32_t colorOff(){ return RGBW32(0x00,0x00,0x00,0x00); }
+
+static inline void paintPixelGlobal(uint16_t globalIndex, uint32_t col){
+  strip.setPixelColor(globalIndex, col);
+}
 
 // ------------------- UI HTML (PROGMEM) -------------------
 // Adds a read-only L/I/M/V indicator column. Greyed if SKIP or no ICAO.
@@ -343,7 +341,7 @@ async function loadMapProfileUI() {
 document.getElementById('ownToggle').onchange = async (e) => {
   try {
     const en = e.target.checked;
-    await jpost(`/skyaware.api/own?enable=${en?1:0}`);
+    await jpost(`/skyaware/own?enable=${en?1:0}`);
     const meta = await jget('/json/skyaware');
     if (en) {
       const segDefs = meta.segments.map(s => ({ id:s.id, fx:0, frz:true, col:[[WARM_HEX]] }));
@@ -373,7 +371,7 @@ document.getElementById('csvFile').addEventListener('change', async (ev)=>{
   const f = ev.target.files[0]; if (!f) return;
   try{
     const text = await f.text();
-    const r = await fetch('/skyaware.api/csv', { method:'POST', headers:{'Content-Type':'text/plain; charset=utf-8'}, body:text });
+    const r = await fetch('/skyaware/csv', { method:'POST', headers:{'Content-Type':'text/plain; charset=utf-8'}, body:text });
     if (!r.ok) throw new Error(await r.text());
     currentProfileName = 'Custom'; const sel = document.getElementById('mapProfile'); if (sel) sel.value = 'Custom';
     await refresh();
@@ -381,11 +379,15 @@ document.getElementById('csvFile').addEventListener('change', async (ev)=>{
   ev.target.value='';
 });
 
-document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware.api/csv'; };
+document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware/csv'; };
 
 async function refreshCats(){
   try{
-    const r = await fetch('/skyaware.api/cats'); if (!r.ok) return; const j = await r.json(); if (!j||!j.ok) return;
+    // Prefer new API; fall back to legacy if needed
+    let r = await fetch('/skyaware.api/cats'); 
+    if (!r.ok) r = await fetch('/skyaware/cats');
+    if (!r.ok) return;
+    const j = await r.json(); if (!j||!j.ok) return;
     const map = new Map(); (j.airports||[]).forEach(a=>{ if(a&&a.icao) map.set(a.icao.toUpperCase(), a); });
     document.querySelectorAll('tr.map-row').forEach(tr=>{
       const icao = (tr.dataset.icao||'').toUpperCase();
@@ -454,7 +456,7 @@ public:
               uint16_t idx=0; int start=0;
               while (start <= (int)csv.length()) {
                 int comma = csv.indexOf(',', start);
-                if (comma < 0) comma = csv.length();
+                if (comma < 0) comma = csv.length();   // FIXED
                 String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
                 if (ap == "-") ap = "SKIP";
                 if (ap.length()) inner[idx] = ap;
@@ -481,7 +483,7 @@ public:
           uint16_t idx=0; int start=0;
           while (start <= (int)csv.length()) {
             int comma = csv.indexOf(',', start);
-            if (comma < 0) comma = csv.length();
+            if (comma < 0) comma = csv.length();   // FIXED
             String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
             if (ap.length()) inner[idx] = ap;
             idx++; start = comma + 1;
@@ -623,14 +625,20 @@ public:
   }
 
   // ---- Own/Release (no repaint) ----
-  static inline void enforceOwnOn() {
-    const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
-    for (uint16_t i = 0; i < segCount; i++) {
-      Segment& s = strip.getSegment(i);
-      if (s.mode != FX_MODE_STATIC) s.setMode(FX_MODE_STATIC);
-      if (!s.getOption(SEG_OPTION_FREEZE)) s.setOption(SEG_OPTION_FREEZE, true);
-    }
+static inline void enforceOwnOn() {
+  if (!bri) bri = 255;
+  strip.setBrightness(bri);
+  const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
+  for (uint16_t i = 0; i < segCount; i++) {
+    Segment& s = strip.getSegment(i);
+    if (s.mode != FX_MODE_STATIC) s.setMode(FX_MODE_STATIC);
+    s.setOption(SEG_OPTION_FREEZE, true);  // stop the renderer from touching pixels
+    s.setOption(SEG_OPTION_ON, true);      // visible
+    s.setOpacity(255);
   }
+}
+
+
   static inline void enforceOwnOff() {
     const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
     for (uint16_t i = 0; i < segCount; i++) {
@@ -638,6 +646,51 @@ public:
       if (s.getOption(SEG_OPTION_FREEZE)) s.setOption(SEG_OPTION_FREEZE, false);
     }
   }
+
+  // ---------------- repaint helpers ----------------
+  void repaintIcao(const String& icaoUpper){
+  // segments must already be owned/frozen/visible (see enforceOwnOn)
+  for (auto &segPair : segMap) {
+    uint8_t segId = segPair.first;
+    Segment& s = strip.getSegment(segId);
+
+    for (auto &idxPair : segPair.second) {
+      const uint16_t li = idxPair.first;
+      const String& ap  = idxPair.second;
+
+      if (ap.equalsIgnoreCase("SKIP")) { s.setPixelColor(li, colorOff()); continue; }
+      if (!ap.equalsIgnoreCase(icaoUpper)) continue;
+
+      SkyCat cat; uint32_t ts;
+      SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
+      s.setPixelColor(li, colorForCat(c));  // write into your buffer (segment-local)
+    }
+  }
+  // IMPORTANT: don't call stateUpdated() here—just push the buffer
+  strip.show();
+}
+
+void repaintAllFromCats(){
+  const uint16_t lastSegId = strip.getLastActiveSegmentId();
+  for (uint16_t si = 0; si <= lastSegId; si++) {
+    Segment& s = strip.getSegment(si);
+    auto it = segMap.find((uint8_t)si);
+    if (it == segMap.end()) continue;
+
+    for (auto &idxPair : it->second) {
+      const uint16_t li = idxPair.first;
+      const String& ap  = idxPair.second;
+
+      if (ap.equalsIgnoreCase("SKIP")) { s.setPixelColor(li, colorOff()); continue; }
+      SkyCat cat; uint32_t ts;
+      SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
+      s.setPixelColor(li, colorForCat(c));
+    }
+  }
+  // Push only
+  strip.show();
+}
+
 
   void registerHTTP() {
     // ---- UI ----
@@ -668,7 +721,7 @@ public:
       auto* res = r->beginResponse(200, "application/json", out); addNoCache(res); r->send(res);
     });
 
-    // Apply profile (unchanged semantics)
+    // Apply profile
     server.on("/skyaware.api/apply", HTTP_POST, [this](AsyncWebServerRequest* r){
       String profile = r->hasArg("mapProfile") ? r->arg("mapProfile") : ""; profile.trim();
       if (!profile.length()) { r->send(400,"text/plain","missing mapProfile"); return; }
@@ -683,18 +736,20 @@ public:
           segMap.clear();
           if (WLED_FS.exists(SKY_MAP_PATH)) { File f=WLED_FS.open(SKY_MAP_PATH, "r"); if (f){ DynamicJsonDocument d(8192); if (deserializeJson(d,f)==DeserializationError::Ok){ JsonObject map=d["map"].as<JsonObject>(); for (JsonPair p:map){ uint8_t seg=(uint8_t)strtoul(p.key().c_str(),nullptr,10); if(!p.value().is<const char*>()) continue; String csv=p.value().as<const char*>(); std::map<uint16_t,String> inner; uint16_t idx=0; int start=0; while(start <= (int)csv.length()){ int comma=csv.indexOf(',',start); if(comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if(ap.length()) inner[idx]=ap; idx++; start=comma+1; if(start>(int)csv.length()) break; } if(!inner.empty()) segMap[seg]=std::move(inner);} } f.close(); } }
           { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+          repaintAllFromCats();
           r->send(200,"text/plain","ok"); return;
         }
 
         mapProfile = "Custom"; segMap.clear();
         for (auto &row : csvRows) {
           std::map<uint16_t, String> inner; String csv=row.second; uint16_t idx=0; int start=0;
-          while (start <= (int)csv.length()) { int comma=csv.indexOf(',',start); if (comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if (start>(int)csv.length()) break; }
+          while (start <= (int)csv.length()) { int comma=csv.indexOf(',',start); if (comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if (start>(int)csv.length()) break; }  // FIXED
           if (!inner.empty()) segMap[row.first]=std::move(inner);
         }
         if (!WLED_FS.exists(SKY_CFG_DIR)) { WLED_FS.mkdir(SKY_CFG_DIR); }
         { DynamicJsonDocument d(4096); JsonObject rootObj=d.to<JsonObject>(); JsonObject map=rootObj.createNestedObject("map"); for (auto &segPair:segMap){ const uint8_t seg=segPair.first; const auto &idxMap=segPair.second; uint16_t maxIdx=0; for (const auto &kv:idxMap) if (kv.first>maxIdx) maxIdx=kv.first; String csv; for (uint16_t i=0;i<=maxIdx;i++){ if(i) csv+=','; auto it=idxMap.find(i); if(it!=idxMap.end()) csv+=it->second; } char key[6]; snprintf(key,sizeof(key),"%u",(unsigned)seg); map[key]=csv; } File f=WLED_FS.open(SKY_MAP_PATH,"w"); bool ok=false; if(f){ ok=(serializeJson(d,f)>0); f.close(); } if(!ok){ r->send(500,"text/plain","map.json write failed"); return; } }
         { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+        repaintAllFromCats();
         r->send(200,"text/plain","ok"); return;
       }
 
@@ -702,31 +757,26 @@ public:
       mapProfile = profile; using namespace SkyAwarePreloads; segMap.clear(); bool ok=false;
       for (uint8_t i=0;i<PRESET_COUNT;i++){ String pname=String(FPSTR(PRESETS[i].name)); if(!pname.equalsIgnoreCase(mapProfile)) continue; const CsvMap* rows=PRESETS[i].rows; for(uint8_t rix=0; rix<PRESETS[i].count; rix++){ uint8_t seg=pgm_read_byte(&rows[rix].segment); const char* csvPtr=(const char*)pgm_read_ptr(&rows[rix].csv); String csv=String(FPSTR(csvPtr)); std::map<uint16_t,String> inner; uint16_t idx=0; int start=0; while(start <= (int)csv.length()){ int comma=csv.indexOf(',',start); if(comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if(start>(int)csv.length()) break; } if(!inner.empty()) segMap[seg]=std::move(inner);} ok=true; break; }
       { DynamicJsonDocument pd(256); pd["mapProfile"]=mapProfile; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+      repaintAllFromCats();
       r->send(ok ? 200 : 404, "text/plain", ok ? "ok" : "preset not found");
     });
 
-    // ---- Stage-0 metadata endpoint (UI pulls this)
+    // ---- Stage-0 endpoints ----
     server.on("/json/skyaware", HTTP_GET, [this](AsyncWebServerRequest* r){ handleMeta(r); });
 
-    // ---- OWN / RELEASE (new path)
-    server.on("/skyaware.api/own", HTTP_POST, [this](AsyncWebServerRequest* r){
+    server.on("/skyaware/own", HTTP_POST, [this](AsyncWebServerRequest* r){
       String v; const int n=r->params();
       for (int i=0;i<n;i++){ auto* p=r->getParam(i); if(p && p->name()=="enable"){ v=p->value(); break; } }
-      if (!v.length()) { r->send(400,"application/json","{\"ok\":false,\"err\":\"missing enable\"}"); return; }
+      if (!v.length()) { r->send(400,"text/plain","missing enable"); return; }
       ownSegmentsEnabled = (v != "0");
-      if (ownSegmentsEnabled) {
-  enforceOwnOn();
-  _needsRepaint = true;     // now that we own, paint from cats
-} else {
-  enforceOwnOff();
-}
-
-      r->send(200,"application/json", ownSegmentsEnabled ? "{\"ok\":true,\"state\":\"owned\"}" : "{\"ok\":true,\"state\":\"released\"}");
+      if (ownSegmentsEnabled) enforceOwnOn(); else enforceOwnOff();
+      if (ownSegmentsEnabled) repaintAllFromCats();
+      r->send(200,"text/plain", ownSegmentsEnabled ? "owned" : "released");
     });
 
-    // ---- CSV export/import (new paths)
-    server.on("/skyaware.api/csv", HTTP_GET,  [this](AsyncWebServerRequest* r){ sendCsv(r); });
-    server.on("/skyaware.api/csv", HTTP_POST,
+    // CSV export/import
+    server.on("/skyaware/csv", HTTP_GET,  [this](AsyncWebServerRequest* r){ sendCsv(r); });
+    server.on("/skyaware/csv", HTTP_POST,
       [this](AsyncWebServerRequest* r){
         String *buf = (String*) r->_tempObject;
         if (!buf || buf->length() == 0) {
@@ -737,6 +787,7 @@ public:
         String err; bool ok = importCsvBody(*buf, err); delete buf; r->_tempObject = nullptr;
         if (!ok) { r->send(400, "text/plain", err.length()?err:"parse error"); return; }
         mapProfile = "Custom"; { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+        repaintAllFromCats();
         r->send(200, "text/plain", "ok");
       },
       /* onUpload */ nullptr,
@@ -747,29 +798,51 @@ public:
       }
     );
 
-    // ---- Last-known category endpoints (new paths)
+    // ---- NEW: last-known category endpoints (standard) ----
     server.on("/skyaware.api/cat", HTTP_POST, [this](AsyncWebServerRequest* req){
       String icao = req->hasArg("icao") ? req->arg("icao") : "";
       String catS = req->hasArg("cat")  ? req->arg("cat")  : "";
       String tsS  = req->hasArg("ts")   ? req->arg("ts")   : "";
-      icao.trim(); catS.trim(); tsS.trim();
+      icao.trim(); catS.trim(); tsS.trim(); icao.toUpperCase();
       if (icao.length()!=4 || catS.length()==0) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao or cat\"}"); return; }
       SkyCat c = strToCat(catS); uint32_t ts = tsS.length()? (uint32_t)tsS.toInt() : sa_nowSeconds();
       _catCache.upsert(icao.c_str(), c, ts);
-      _needsRepaint = true;
+      repaintIcao(icao);
       DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
-
     server.on("/skyaware.api/cat", HTTP_GET, [this](AsyncWebServerRequest* req){
-      String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim();
+      String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim(); icao.toUpperCase();
       if (icao.length()!=4) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao\"}"); return; }
       SkyCat c; uint32_t ts; DynamicJsonDocument d(256); d["icao"]=icao;
       if (_catCache.get(icao.c_str(), c, ts)) { d["ok"]=true; d["cat"]=catToStr(c); d["updated"]=ts; }
       else { d["ok"]=false; d["err"]="not_found"; }
       String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
-
     server.on("/skyaware.api/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
+      DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
+
+    // ---- Legacy mirrors for dev convenience ----
+    server.on("/skyaware/cat", HTTP_POST, [this](AsyncWebServerRequest* req){
+      String icao = req->hasArg("icao") ? req->arg("icao") : "";
+      String catS = req->hasArg("cat")  ? req->arg("cat")  : "";
+      String tsS  = req->hasArg("ts")   ? req->arg("ts")   : "";
+      icao.trim(); catS.trim(); tsS.trim(); icao.toUpperCase();
+      if (icao.length()!=4 || catS.length()==0) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao or cat\"}"); return; }
+      SkyCat c = strToCat(catS); uint32_t ts = tsS.length()? (uint32_t)tsS.toInt() : sa_nowSeconds();
+      _catCache.upsert(icao.c_str(), c, ts);
+      repaintIcao(icao);
+      DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
+    server.on("/skyaware/cat", HTTP_GET, [this](AsyncWebServerRequest* req){
+      String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim(); icao.toUpperCase();
+      if (icao.length()!=4) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao\"}"); return; }
+      SkyCat c; uint32_t ts; DynamicJsonDocument d(256); d["icao"]=icao;
+      if (_catCache.get(icao.c_str(), c, ts)) { d["ok"]=true; d["cat"]=catToStr(c); d["updated"]=ts; }
+      else { d["ok"]=false; d["err"]="not_found"; }
+      String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
+    server.on("/skyaware/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
       DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
   }
@@ -779,62 +852,28 @@ public:
     if (!WLED_FS.exists(SKY_CFG_DIR)) { WLED_FS.mkdir(SKY_CFG_DIR); }
     { DynamicJsonDocument d(256); d["mapProfile"] = mapProfile; File f=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(f){ serializeJson(d,f); f.close(); } }
     if (initialized) return;
+
+    // Ensure device is on and bright prior to first paint
+    if (!bri) bri = 255;
+    strip.setBrightness(bri);
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
+
     enforceOwnOn();
     registerHTTP();
+    repaintAllFromCats(); // paint whatever we have
     initialized = true;
-    _needsRepaint = true;
   }
 
-void loop() override {
-  if (!initialized) return;
-  if (ownSegmentsEnabled) enforceOwnOn();
-  if (ownSegmentsEnabled && _needsRepaint) {
-    repaintAllFromCats();
-    _needsRepaint = false;
+  void loop() override {
+    if (!initialized) return;
+    if (ownSegmentsEnabled) enforceOwnOn();
+    // future: background fetcher can call _catCache.upsert(...) then repaintIcao(...)
   }
-}
 
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
-  private:
-  SkyCatCache _catCache;            // bounded last-known categories
-  volatile bool _needsRepaint = false;
-
-  void paintFromCatsForSeg(uint16_t segId) {
-    auto it = segMap.find((uint8_t)segId);
-    if (it == segMap.end()) return;
-
-    Segment& s = strip.getSegment(segId);
-    const auto& idxMap = it->second;
-
-    for (const auto& kv : idxMap) {
-      uint16_t li = kv.first;
-      if (li >= s.length()) continue;
-
-      const String& v = kv.second;         // "SKIP" or "Kxxx"
-      if (v.equalsIgnoreCase("SKIP")) {
-        strip.setPixelColor(s.start + li, COL_SKIP);
-        continue;
-      }
-      if (v.length() == 4) {
-        SkyCat c; uint32_t ts;
-        if (_catCache.get(v.c_str(), c, ts)) {
-          strip.setPixelColor(s.start + li, colorForCat(c));
-        } else {
-          strip.setPixelColor(s.start + li, COL_UNKNOWN);
-        }
-      } else {
-        strip.setPixelColor(s.start + li, COL_UNKNOWN);
-      }
-    }
-  }
-
-  void repaintAllFromCats() {
-    const uint16_t lastSegId = strip.getLastActiveSegmentId();
-    for (uint16_t si = 0; si <= lastSegId; si++) paintFromCatsForSeg(si);
-    colorUpdated(CALL_MODE_DIRECT_CHANGE);
-  }
-
+private:
+  SkyCatCache _catCache; // bounded last-known categories
 };
 
 // Global instance + registration
