@@ -57,6 +57,24 @@ static inline SkyCat strToCat(const String& s){
 }
 static inline uint32_t sa_nowSeconds(){ time_t t=time(nullptr); return (t>100000)?(uint32_t)t:(millis()/1000); }
 
+// ---- Category -> color policy (RGB) ----
+static const uint32_t COL_LIFR    = 0xFF3FFF;  // magenta-ish
+static const uint32_t COL_IFR     = 0xFF4B4B;  // red
+static const uint32_t COL_MVFR    = 0x3A68FF;  // blue
+static const uint32_t COL_VFR     = 0x20C15A;  // green
+static const uint32_t COL_UNKNOWN = 0x202020;  // dim gray
+static const uint32_t COL_SKIP    = 0x000000;  // off
+
+static inline uint32_t colorForCat(SkyCat c) {
+  switch (c) {
+    case CAT_LIFR: return COL_LIFR;
+    case CAT_IFR:  return COL_IFR;
+    case CAT_MVFR: return COL_MVFR;
+    case CAT_VFR:  return COL_VFR;
+    default:       return COL_UNKNOWN;
+  }
+}
+
 #ifndef SKY_CAT_CACHE_MAX
   #define SKY_CAT_CACHE_MAX 256
 #endif
@@ -696,7 +714,13 @@ public:
       for (int i=0;i<n;i++){ auto* p=r->getParam(i); if(p && p->name()=="enable"){ v=p->value(); break; } }
       if (!v.length()) { r->send(400,"application/json","{\"ok\":false,\"err\":\"missing enable\"}"); return; }
       ownSegmentsEnabled = (v != "0");
-      if (ownSegmentsEnabled) enforceOwnOn(); else enforceOwnOff();
+      if (ownSegmentsEnabled) {
+  enforceOwnOn();
+  _needsRepaint = true;     // now that we own, paint from cats
+} else {
+  enforceOwnOff();
+}
+
       r->send(200,"application/json", ownSegmentsEnabled ? "{\"ok\":true,\"state\":\"owned\"}" : "{\"ok\":true,\"state\":\"released\"}");
     });
 
@@ -732,6 +756,7 @@ public:
       if (icao.length()!=4 || catS.length()==0) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao or cat\"}"); return; }
       SkyCat c = strToCat(catS); uint32_t ts = tsS.length()? (uint32_t)tsS.toInt() : sa_nowSeconds();
       _catCache.upsert(icao.c_str(), c, ts);
+      _needsRepaint = true;
       DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
 
@@ -757,18 +782,59 @@ public:
     enforceOwnOn();
     registerHTTP();
     initialized = true;
+    _needsRepaint = true;
   }
 
-  void loop() override {
-    if (!initialized) return;
-    if (ownSegmentsEnabled) enforceOwnOn();
-    // future: background fetcher can call _catCache.upsert(...)
+void loop() override {
+  if (!initialized) return;
+  if (ownSegmentsEnabled) enforceOwnOn();
+  if (ownSegmentsEnabled && _needsRepaint) {
+    repaintAllFromCats();
+    _needsRepaint = false;
   }
+}
 
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
-private:
-  SkyCatCache _catCache; // bounded last-known categories
+  private:
+  SkyCatCache _catCache;            // bounded last-known categories
+  volatile bool _needsRepaint = false;
+
+  void paintFromCatsForSeg(uint16_t segId) {
+    auto it = segMap.find((uint8_t)segId);
+    if (it == segMap.end()) return;
+
+    Segment& s = strip.getSegment(segId);
+    const auto& idxMap = it->second;
+
+    for (const auto& kv : idxMap) {
+      uint16_t li = kv.first;
+      if (li >= s.length()) continue;
+
+      const String& v = kv.second;         // "SKIP" or "Kxxx"
+      if (v.equalsIgnoreCase("SKIP")) {
+        strip.setPixelColor(s.start + li, COL_SKIP);
+        continue;
+      }
+      if (v.length() == 4) {
+        SkyCat c; uint32_t ts;
+        if (_catCache.get(v.c_str(), c, ts)) {
+          strip.setPixelColor(s.start + li, colorForCat(c));
+        } else {
+          strip.setPixelColor(s.start + li, COL_UNKNOWN);
+        }
+      } else {
+        strip.setPixelColor(s.start + li, COL_UNKNOWN);
+      }
+    }
+  }
+
+  void repaintAllFromCats() {
+    const uint16_t lastSegId = strip.getLastActiveSegmentId();
+    for (uint16_t si = 0; si <= lastSegId; si++) paintFromCatsForSeg(si);
+    colorUpdated(CALL_MODE_DIRECT_CHANGE);
+  }
+
 };
 
 // Global instance + registration
