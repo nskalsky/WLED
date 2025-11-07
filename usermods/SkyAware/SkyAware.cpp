@@ -1,6 +1,16 @@
 // usermods/skyaware/SkyAware.cpp
-// SkyAware — Stage 0 (WLED 0.16.0-alpha compatible)
+// SkyAware — Stage 0 (WLED 0.16.0-alpha compatible) + Last-Known Flight Category cache & read-only indicators
 //
+// WHAT'S NEW (adds without removing your Stage 0 features):
+// • In-RAM bounded cache of last-known flight categories per ICAO (with timestamp)
+// • HTTP endpoints to set/read that cache (no METAR fetcher yet), now standardized under /skyaware.api/*:
+//      POST /skyaware.api/cat  -> icao=KHIO&cat=IFR[&ts=1730850000]
+//      GET  /skyaware.api/cat?icao=KHIO
+//      GET  /skyaware.api/cats
+// • /skyaware UI shows read-only L/I/M/V pills per LED row (grey if SKIP/no ICAO)
+// • Preserves ALL of your Stage-0 behaviors: profiles, CSV import/export, own/release, ID button, etc.
+//
+// -----------------------------------------------------------------------------
 // - Owns/releases segments (STATIC + FREEZE). Firmware never repaints pixels.
 // - UI at /skyaware: Map Profile dropdown (+ auto-apply for presets), Apply Profile button,
 //   per-LED table (Airport column), ID buttons, CSV import/export.
@@ -19,6 +29,7 @@
 #include <pgmspace.h>
 #include <map>
 #include <vector>
+#include <time.h>
 #include "preloadmaps.h"   // namespace SkyAwarePreloads { PRESET_COUNT; struct CsvMap{uint8_t segment; const char* csv;}; PRESETS[] }
 
 #ifndef SKY_CFG_DIR
@@ -31,7 +42,42 @@
   #define SKY_PROFILE_PATH "/skyaware/config.json"
 #endif
 
+// ================= Last-known category cache (bounded) ======================
+// Categories
+enum SkyCat : int8_t { CAT_UNKNOWN=0, CAT_LIFR=1, CAT_IFR=2, CAT_MVFR=3, CAT_VFR=4 };
+static inline const char* catToStr(SkyCat c){
+  switch(c){ case CAT_LIFR:return "LIFR"; case CAT_IFR:return "IFR"; case CAT_MVFR:return "MVFR"; case CAT_VFR:return "VFR"; default:return "UNKNOWN"; }
+}
+static inline SkyCat strToCat(const String& s){
+  if (s.equalsIgnoreCase("LIFR")) return CAT_LIFR;
+  if (s.equalsIgnoreCase("IFR"))  return CAT_IFR;
+  if (s.equalsIgnoreCase("MVFR")) return CAT_MVFR;
+  if (s.equalsIgnoreCase("VFR"))  return CAT_VFR;
+  return CAT_UNKNOWN;
+}
+static inline uint32_t sa_nowSeconds(){ time_t t=time(nullptr); return (t>100000)?(uint32_t)t:(millis()/1000); }
+
+#ifndef SKY_CAT_CACHE_MAX
+  #define SKY_CAT_CACHE_MAX 256
+#endif
+struct CatRecord { char icao[5]; SkyCat cat; uint32_t updated; bool inUse; CatRecord(): icao{0}, cat(CAT_UNKNOWN), updated(0), inUse(false){} };
+class SkyCatCache {
+public:
+  SkyCatCache(): _count(0){ for(int i=0;i<SKY_CAT_CACHE_MAX;i++) rec[i]=CatRecord(); }
+  void upsert(const char* icao4, SkyCat cat, uint32_t ts){ int i=find(icao4); if(i>=0){ rec[i].cat=cat; rec[i].updated=ts; rec[i].inUse=true; return; } int s=firstFree(); if(s<0) s=evictOldest(); writeAt(s,icao4,cat,ts); if(!rec[s].inUse){rec[s].inUse=true; _count++;} }
+  bool get(const char* icao4, SkyCat& out, uint32_t& ts) const { int i=find(icao4); if(i<0) return false; out=rec[i].cat; ts=rec[i].updated; return true; }
+  template<class D> void toJson(D& d) const { auto a=d.createNestedArray("airports"); for(int i=0;i<SKY_CAT_CACHE_MAX;i++){ if(!rec[i].inUse) continue; auto o=a.createNestedObject(); o["icao"]=rec[i].icao; o["cat"]=catToStr(rec[i].cat); o["updated"]=rec[i].updated; } }
+  uint16_t size() const { return _count; }
+private:
+  CatRecord rec[SKY_CAT_CACHE_MAX]; uint16_t _count;
+  int find(const char* icao4) const { if(!icao4||strlen(icao4)<3) return -1; for(int i=0;i<SKY_CAT_CACHE_MAX;i++){ if(rec[i].inUse && strncmp(rec[i].icao,icao4,4)==0) return i; } return -1; }
+  int firstFree() const { for(int i=0;i<SKY_CAT_CACHE_MAX;i++) if(!rec[i].inUse) return i; return -1; }
+  int evictOldest(){ int b=-1; uint32_t ts=UINT32_MAX; for(int i=0;i<SKY_CAT_CACHE_MAX;i++){ if(rec[i].inUse && rec[i].updated<ts){ b=i; ts=rec[i].updated; } } if(b>=0) rec[b].inUse=false; return (b>=0)?b:0; }
+  void writeAt(int idx,const char* icao4,SkyCat cat,uint32_t ts){ if(idx<0||idx>=SKY_CAT_CACHE_MAX||!icao4) return; strncpy(rec[idx].icao,icao4,4); rec[idx].icao[4]='\0'; rec[idx].cat=cat; rec[idx].updated=ts; }
+};
+
 // ------------------- UI HTML (PROGMEM) -------------------
+// Adds a read-only L/I/M/V indicator column. Greyed if SKIP or no ICAO.
 static const char SKYAWARE_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html lang="en">
@@ -39,7 +85,7 @@ static const char SKYAWARE_HTML[] PROGMEM = R"HTML(
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SkyAware — Stage 0</title>
 <style>
-:root{--bg:#0f1115;--card:#171a21;--text:#e8ecf3;--muted:#a0a6b6;--btn:#2a3042;--btnh:#353c55;--hr:#242a3a;--cyan:#00ffff}
+:root{--bg:#0f1115;--card:#171a21;--text:#e8ecf3;--muted:#a0a6b6;--btn:#2a3042;--btnh:#353c55;--hr:#242a3a;--cyan:#00ffff;--lifr:#ff3fff;--ifr:#ff4b4b;--mvfr:#3a68ff;--vfr:#20c15a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
 header{padding:14px 18px;border-bottom:1px solid var(--hr)}h1{margin:0;font-size:18px}
 main{padding:16px 18px}
@@ -60,6 +106,13 @@ input[type="file"]{display:none}
 label.filebtn{padding:6px 10px;border-radius:8px;background:#2a3042;cursor:pointer}
 label.filebtn:hover{background:#353c55}
 .small{font-size:12px}
+/* last-known pills */
+.pills{display:flex;gap:.35rem}
+.pill{padding:.15rem .35rem;border-radius:.45rem;border:1px solid var(--hr);opacity:.45;font-weight:700;font-size:11px}
+.pill.active{opacity:1;border-color:#fff}
+.pill.lifr{background:var(--lifr)} .pill.ifr{background:var(--ifr)} .pill.mvfr{background:var(--mvfr)} .pill.vfr{background:var(--vfr)}
+tr.skip .pills, tr.no-icao .pills { opacity:.35; filter:grayscale(90%); }
+.updated{color:var(--muted);font-size:12px}
 </style>
 </head>
 <body>
@@ -119,13 +172,20 @@ async function jpost(u){ const r=await fetch(u,{method:'POST'}); if(!r.ok) throw
 async function postState(payload){ await fetch('/json/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); }
 function hex(n){ return n.toString(16).padStart(2,'0'); }
 function rgb2hex(r,g,b){ return '#'+hex(r)+hex(g)+hex(b); }
-function stripHash(H){ return (H||'').replace(/^#/,'').toUpperCase(); }
+function stripHash(H){ return (H||'').replace(/^#/, '').toUpperCase(); }
 
 let active = null; // {seg, idx, prevHex}
 let autoTimer = null;
 async function setLedHex(segId, idx, hexNoHash){ await postState({ seg: { id: segId, i: [ idx, hexNoHash ] } }); }
 async function restoreActive(){ if (!active) return; try{ await setLedHex(active.seg, active.idx, active.prevHex);} finally{ active=null; if (autoTimer){ clearTimeout(autoTimer); autoTimer=null; } } }
 function armAutoClear(){ if (!AUTO_CLEAR_MS) return; if (autoTimer) clearTimeout(autoTimer); autoTimer=setTimeout(async()=>{ try{ await restoreActive(); await refresh(); }catch(e){ showErr(e.message);} }, AUTO_CLEAR_MS); }
+
+function mkPills(){
+  const div=document.createElement('div'); div.className='pills';
+  const mk=(cls,txt)=>{ const s=document.createElement('span'); s.className='pill '+cls; s.textContent=txt; return s; };
+  div.appendChild(mk('lifr','L')); div.appendChild(mk('ifr','I')); div.appendChild(mk('mvfr','M')); div.appendChild(mk('vfr','V'));
+  return div;
+}
 
 function segTable(seg, mapForSeg, editable){
   const wrap=document.createElement('div'); wrap.className='card';
@@ -135,12 +195,12 @@ function segTable(seg, mapForSeg, editable){
 
   const table=document.createElement('table');
   const thead=document.createElement('thead');
-  thead.innerHTML='<tr><th style="width:72px">Index</th><th>Color</th><th style="min-width:160px">Airport</th><th style="width:92px">ID</th></tr>';
+  thead.innerHTML='<tr><th style="width:72px">Index</th><th>Color</th><th style="min-width:160px">Airport</th><th>Last Known</th><th class="updated">Updated</th><th style="width:92px">ID</th></tr>';
   table.appendChild(thead);
 
   const tbody=document.createElement('tbody');
   seg.leds.forEach(L=>{
-    const tr=document.createElement('tr');
+    const tr=document.createElement('tr'); tr.className='map-row'; tr.dataset.seg=seg.id; tr.dataset.idx=L.i;
 
     const tdIdx=document.createElement('td'); tdIdx.textContent=L.i;
 
@@ -151,43 +211,35 @@ function segTable(seg, mapForSeg, editable){
     tdCol.appendChild(sw); tdCol.appendChild(label);
 
     const tdAirport=document.createElement('td');
-    const apKey = String(L.i);
+    const apKey=String(L.i);
     const input=document.createElement('input'); input.type='text'; input.placeholder= editable ? 'KPDX or SKIP' : 'Preset (read-only)';
     input.value = (mapForSeg && mapForSeg[apKey]) ? mapForSeg[apKey] : '';
-    input.readOnly = !editable;
-    if (!editable) { input.title = 'Preset profile: read-only'; input.style.opacity='0.7'; }
-    input.id = `ap-${seg.id}-${L.i}`; // used by Apply Profile
-    if (editable) {
-      input.oninput=()=>{ input.value = input.value.toUpperCase(); };
-    }
+    input.readOnly = !editable; if (!editable) { input.title='Preset profile: read-only'; input.style.opacity='0.7'; }
+    input.id = `ap-${seg.id}-${L.i}`;
+    if (editable) input.oninput=()=>{ input.value = input.value.toUpperCase(); updateRowType(tr,input.value); };
     tdAirport.appendChild(input);
+
+    const tdPills=document.createElement('td'); tdPills.appendChild(mkPills());
+    const tdUpd=document.createElement('td'); tdUpd.className='updated';
 
     const tdBtn=document.createElement('td');
     const btn=document.createElement('button');
     const isActive = active && active.seg===seg.id && active.idx===L.i;
-    const isSkip = (mapForSeg && (mapForSeg[apKey]||'').toUpperCase().trim()==='SKIP');
     btn.textContent = isActive ? 'ID (ON)' : 'ID';
     if (isActive) btn.classList.add('badge-on');
-    if (isSkip) { btn.title='SKIP (disabled)'; btn.style.opacity='0.5'; }
-
     btn.onclick=async()=>{
       try{
-        if (isSkip) return;
+        if (tr.classList.contains('skip')||tr.classList.contains('no-icao')) return;
         const currentHex = stripHash(rgb2hex(L.r||0,L.g||0,L.b||0));
-        if (active && active.seg===seg.id && active.idx===L.i) {
-          await restoreActive();
-        } else {
-          if (active) await restoreActive();
-          active = { seg: seg.id, idx: L.i, prevHex: currentHex };
-          await setLedHex(seg.id, L.i, "00FFFF");
-          armAutoClear();
-        }
+        if (active && active.seg===seg.id && active.idx===L.i) { await restoreActive(); }
+        else { if (active) await restoreActive(); active={ seg: seg.id, idx: L.i, prevHex: currentHex }; await setLedHex(seg.id,L.i,"00FFFF"); armAutoClear(); }
         await refresh();
       }catch(e){ showErr(e.message); }
     };
     tdBtn.appendChild(btn);
 
-    tr.appendChild(tdIdx); tr.appendChild(tdCol); tr.appendChild(tdAirport); tr.appendChild(tdBtn);
+    tr.appendChild(tdIdx); tr.appendChild(tdCol); tr.appendChild(tdAirport); tr.appendChild(tdPills); tr.appendChild(tdUpd); tr.appendChild(tdBtn);
+    updateRowType(tr, input.value);
     tbody.appendChild(tr);
   });
 
@@ -196,34 +248,38 @@ function segTable(seg, mapForSeg, editable){
   return wrap;
 }
 
+function updateRowType(tr, val){
+  const v=(val||'').toUpperCase().trim();
+  tr.dataset.icao = (v && v!== 'SKIP' && v!=='-') ? v : '';
+  const isSkip = (v==='SKIP'||v==='-');
+  tr.dataset.type = isSkip? 'SKIP' : (tr.dataset.icao? 'AIRPORT':'NONE');
+  tr.classList.toggle('skip', isSkip);
+  tr.classList.toggle('no-icao', !tr.dataset.icao);
+}
+
 async function refresh(){
   hideErr();
   const meta = await jget('/json/skyaware');
   lastMeta = meta;
 
-  const ownT = document.getElementById('ownToggle');
-  if (ownT) ownT.checked = !!meta.own;
+  const ownT = document.getElementById('ownToggle'); if (ownT) ownT.checked = !!meta.own;
 
   if (active) {
     const s = meta.segments.find(x=>x.id===active.seg);
     const L = s ? s.leds.find(x=>x.i===active.idx) : null;
-    if (!L || !(L.r===0 && L.g===255 && L.b===255)) {
-      active=null; if (autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
-    }
+    if (!L || !(L.r===0 && L.g===255 && L.b===255)) { active=null; if (autoTimer){ clearTimeout(autoTimer); autoTimer=null; } }
   }
 
   const c=document.getElementById('segs'); if (c) c.innerHTML='';
   const map = meta.map || {};
   const editable = isEditable();
-  meta.segments.forEach(seg=>{
-    const segMap = map[String(seg.id)] || {};
-    c.appendChild(segTable(seg, segMap, editable));
-  });
+  meta.segments.forEach(seg=>{ const segMap = map[String(seg.id)] || {}; c.appendChild(segTable(seg, segMap, editable)); });
+
+  await refreshCats();
 }
 
 function collectCsvFromTable(){
-  const out = {};
-  if (!lastMeta) return out;
+  const out = {}; if (!lastMeta) return out;
   for (const s of lastMeta.segments) {
     const parts = [];
     for (let i=0; i<s.len; i++) {
@@ -244,76 +300,32 @@ async function loadMapProfileUI() {
       fetchJSON('/skyaware.api/status')
     ]);
 
-    const sel = document.getElementById('mapProfile');
-    sel.innerHTML = '';
-    for (const name of presets) {
-      const opt = document.createElement('option'); opt.value = name; opt.textContent = name; sel.appendChild(opt);
-    }
-    currentProfileName = status.mapProfile || 'Custom';
-    sel.value = currentProfileName;
+    const sel = document.getElementById('mapProfile'); sel.innerHTML = '';
+    for (const name of presets) { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; sel.appendChild(opt); }
+    currentProfileName = status.mapProfile || 'Custom'; sel.value = currentProfileName;
 
-    // AUTO-APPLY preset when selected; when Custom is selected, tell FW to load map.json into RAM
     sel.onchange = async (e) => {
-      const val = e.target.value;
-      currentProfileName = val;
-
-      if (val === 'Custom') {
-        try {
-          const res = await fetch('/skyaware.api/apply', {
-            method:'POST',
-            headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'mapProfile=Custom'
-          });
-          if (!res.ok) throw new Error(await res.text());
-          await refresh(); // now shows map.json content (editable)
-        } catch (err) {
-          showErr('Switch to Custom failed: ' + err.message);
-        }
-        return;
-      }
-      try {
-        const res = await fetch('/skyaware.api/apply', {
-          method:'POST',
-          headers:{'Content-Type':'application/x-www-form-urlencoded'},
-          body:'mapProfile='+encodeURIComponent(val)
-        });
-        if (!res.ok) throw new Error(await res.text());
-        await refresh(); // table now shows the preset mapping from device
-      } catch (err) {
-        showErr('Apply preset failed: ' + err.message);
-      }
+      const val = e.target.value; currentProfileName = val;
+      const body = new URLSearchParams(); body.set('mapProfile', val);
+      try { const res = await fetch('/skyaware.api/apply', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body}); if (!res.ok) throw new Error(await res.text()); await refresh(); } catch (err) { showErr('Apply failed: ' + err.message); }
     };
 
     document.getElementById('applyProfile').onclick = async ()=>{
       try{
-        if (currentProfileName === 'Custom') {
-          const rows = collectCsvFromTable();
-          const data = new URLSearchParams();
-          data.set('mapProfile','Custom');
-          Object.keys(rows).forEach(k => data.set('csv-'+k, rows[k]));
-          const res = await fetch('/skyaware.api/apply', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data });
-          if (!res.ok) throw new Error(await res.text());
-        } else {
-          // in case user clicks apply while in preset, re-assert preset
-          const res = await fetch('/skyaware.api/apply', {
-            method:'POST',
-            headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'mapProfile='+encodeURIComponent(currentProfileName)
-          });
-          if (!res.ok) throw new Error(await res.text());
-        }
+        const data = new URLSearchParams(); data.set('mapProfile', currentProfileName);
+        if (currentProfileName === 'Custom') { const rows = collectCsvFromTable(); Object.keys(rows).forEach(k => data.set('csv-'+k, rows[k])); }
+        const res = await fetch('/skyaware.api/apply', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data });
+        if (!res.ok) throw new Error(await res.text());
         await refresh();
       }catch(e){ showErr('Apply failed: ' + e.message); }
     };
-  } catch (e) {
-    showErr('Profile UI failed: ' + e.message);
-  }
+  } catch (e) { showErr('Profile UI failed: ' + e.message); }
 }
 
 document.getElementById('ownToggle').onchange = async (e) => {
   try {
     const en = e.target.checked;
-    await jpost(`/skyaware/own?enable=${en?1:0}`);
+    await jpost(`/skyaware.api/own?enable=${en?1:0}`);
     const meta = await jget('/json/skyaware');
     if (en) {
       const segDefs = meta.segments.map(s => ({ id:s.id, fx:0, frz:true, col:[[WARM_HEX]] }));
@@ -343,19 +355,33 @@ document.getElementById('csvFile').addEventListener('change', async (ev)=>{
   const f = ev.target.files[0]; if (!f) return;
   try{
     const text = await f.text();
-    const r = await fetch('/skyaware/csv', { method:'POST', headers:{'Content-Type':'text/plain; charset=utf-8'}, body:text });
+    const r = await fetch('/skyaware.api/csv', { method:'POST', headers:{'Content-Type':'text/plain; charset=utf-8'}, body:text });
     if (!r.ok) throw new Error(await r.text());
-
-    // After CSV import, force profile to Custom in UI and refresh
-    currentProfileName = 'Custom';
-    const sel = document.getElementById('mapProfile');
-    if (sel) sel.value = 'Custom';
+    currentProfileName = 'Custom'; const sel = document.getElementById('mapProfile'); if (sel) sel.value = 'Custom';
     await refresh();
   }catch(e){ showErr(e.message); }
   ev.target.value='';
 });
 
-document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware/csv'; };
+document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware.api/csv'; };
+
+async function refreshCats(){
+  try{
+    const r = await fetch('/skyaware.api/cats'); if (!r.ok) return; const j = await r.json(); if (!j||!j.ok) return;
+    const map = new Map(); (j.airports||[]).forEach(a=>{ if(a&&a.icao) map.set(a.icao.toUpperCase(), a); });
+    document.querySelectorAll('tr.map-row').forEach(tr=>{
+      const icao = (tr.dataset.icao||'').toUpperCase();
+      const rec = map.get(icao);
+      const pills = tr.querySelectorAll('.pills .pill'); pills.forEach(p=>p.classList.remove('active'));
+      const upd = tr.querySelector('.updated'); if (upd) upd.textContent = rec? String(rec.updated):'';
+      const cat = rec? String(rec.cat||'').toUpperCase() : 'UNKNOWN';
+      if (cat==='LIFR') tr.querySelector('.pill.lifr')?.classList.add('active');
+      else if (cat==='IFR') tr.querySelector('.pill.ifr')?.classList.add('active');
+      else if (cat==='MVFR') tr.querySelector('.pill.mvfr')?.classList.add('active');
+      else if (cat==='VFR') tr.querySelector('.pill.vfr')?.classList.add('active');
+    });
+  }catch(e){ /* silent */ }
+}
 
 refresh().catch(e=>showErr(e.message));
 loadMapProfileUI().catch(e=>showErr(e.message));
@@ -605,12 +631,9 @@ public:
       DynamicJsonDocument d(1024);
       JsonArray arr = d.to<JsonArray>();
       arr.add("Custom");
-      for (uint8_t i = 0; i < PRESET_COUNT; i++) {
-        arr.add(String(FPSTR(PRESETS[i].name)));
-      }
+      for (uint8_t i = 0; i < PRESET_COUNT; i++) { arr.add(String(FPSTR(PRESETS[i].name))); }
       String out; serializeJson(arr, out);
-      auto* res = r->beginResponse(200, "application/json", out);
-      addNoCache(res); r->send(res);
+      auto* res = r->beginResponse(200, "application/json", out); addNoCache(res); r->send(res);
     });
 
     server.on("/skyaware.api/status", HTTP_GET, [this](AsyncWebServerRequest* r){
@@ -620,179 +643,66 @@ public:
       for (auto &segPair : segMap) {
         char key[6]; snprintf(key, sizeof(key), "%u", (unsigned)segPair.first);
         uint16_t maxIdx = 0; for (auto &kv : segPair.second) if (kv.first > maxIdx) maxIdx = kv.first;
-        String line;
-        for (uint16_t i=0; i<=maxIdx; i++) {
-          if (i) line += ',';
-          auto it = segPair.second.find(i);
-          if (it != segPair.second.end()) line += it->second;
-        }
+        String line; for (uint16_t i=0; i<=maxIdx; i++) { if (i) line += ','; auto it = segPair.second.find(i); if (it != segPair.second.end()) line += it->second; }
         map[key] = line;
       }
       String out; serializeJson(d, out);
-      auto* res = r->beginResponse(200, "application/json", out);
-      addNoCache(res); r->send(res);
+      auto* res = r->beginResponse(200, "application/json", out); addNoCache(res); r->send(res);
     });
 
-    // Apply selected profile:
-    // - If mapProfile=Custom, with csv-<segId> fields -> build segMap and persist to /skyaware/map.json.
-    // - If mapProfile=Custom, with NO csv-<segId> fields -> just reload segMap from /skyaware/map.json.
-    // - If preset, build segMap from PROGMEM and persist only /skyaware/config.json.
+    // Apply profile (unchanged semantics)
     server.on("/skyaware.api/apply", HTTP_POST, [this](AsyncWebServerRequest* r){
-      String profile = r->hasArg("mapProfile") ? r->arg("mapProfile") : "";
-      profile.trim();
+      String profile = r->hasArg("mapProfile") ? r->arg("mapProfile") : ""; profile.trim();
       if (!profile.length()) { r->send(400,"text/plain","missing mapProfile"); return; }
 
       if (profile.equalsIgnoreCase("Custom")) {
-        // collect csv-<segId> fields
-        std::map<uint8_t, String> csvRows;
-        int n = r->params();
-        for (int i=0;i<n;i++) {
-          auto* p = r->getParam(i);
-          if (!p->isPost()) continue;
-          String k = p->name();
-          if (k.startsWith("csv-")) {
-            uint8_t seg = (uint8_t) strtoul(k.substring(4).c_str(), nullptr, 10);
-            csvRows[seg] = p->value();
-          }
-        }
+        // collect csv-<segId>
+        std::map<uint8_t, String> csvRows; int n=r->params();
+        for (int i=0;i<n;i++){ auto* p=r->getParam(i); if (!p->isPost()) continue; String k=p->name(); if (k.startsWith("csv-")) { uint8_t seg=(uint8_t) strtoul(k.substring(4).c_str(), nullptr, 10); csvRows[seg]=p->value(); } }
 
-        // No CSV fields → switch to Custom and reload segMap from persisted map.json
         if (csvRows.empty()) {
           mapProfile = "Custom";
-
           segMap.clear();
-          if (WLED_FS.exists(SKY_MAP_PATH)) {
-            File f = WLED_FS.open(SKY_MAP_PATH, "r");
-            if (f) {
-              DynamicJsonDocument d(8192);
-              if (deserializeJson(d, f) == DeserializationError::Ok) {
-                JsonObject map = d["map"].as<JsonObject>();
-                for (JsonPair p : map) {
-                  uint8_t seg = (uint8_t) strtoul(p.key().c_str(), nullptr, 10);
-                  if (!p.value().is<const char*>()) continue;
-                  String csv = p.value().as<const char*>();
-                  std::map<uint16_t, String> inner;
-                  uint16_t idx=0; int start=0;
-                  while (start <= (int)csv.length()) {
-                    int comma = csv.indexOf(',', start);
-                    if (comma < 0) comma = csv.length();
-                    String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
-                    if (ap == "-") ap = "SKIP";
-                    if (ap.length()) inner[idx] = ap;
-                    idx++; start = comma + 1;
-                    if (start > (int)csv.length()) break;
-                  }
-                  if (!inner.empty()) segMap[seg] = std::move(inner);
-                }
-              }
-              f.close();
-            }
-          }
-
-          // Persist only profile choice
-          { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom";
-            File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
-
-          r->send(200,"text/plain","ok");
-          return;
+          if (WLED_FS.exists(SKY_MAP_PATH)) { File f=WLED_FS.open(SKY_MAP_PATH, "r"); if (f){ DynamicJsonDocument d(8192); if (deserializeJson(d,f)==DeserializationError::Ok){ JsonObject map=d["map"].as<JsonObject>(); for (JsonPair p:map){ uint8_t seg=(uint8_t)strtoul(p.key().c_str(),nullptr,10); if(!p.value().is<const char*>()) continue; String csv=p.value().as<const char*>(); std::map<uint16_t,String> inner; uint16_t idx=0; int start=0; while(start <= (int)csv.length()){ int comma=csv.indexOf(',',start); if(comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if(ap.length()) inner[idx]=ap; idx++; start=comma+1; if(start>(int)csv.length()) break; } if(!inner.empty()) segMap[seg]=std::move(inner);} } f.close(); } }
+          { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+          r->send(200,"text/plain","ok"); return;
         }
 
-        // CSV fields present → build segMap from table, persist to map.json
-        mapProfile = "Custom";
-        segMap.clear();
+        mapProfile = "Custom"; segMap.clear();
         for (auto &row : csvRows) {
-          std::map<uint16_t, String> inner;
-          String csv = row.second;
-          uint16_t idx=0; int start=0;
-          while (start <= (int)csv.length()) {
-            int comma = csv.indexOf(',', start);
-            if (comma < 0) comma = csv.length();
-            String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
-            if (ap == "-") ap = "SKIP";
-            if (ap.length()) inner[idx] = ap;
-            idx++; start = comma + 1;
-            if (start > (int)csv.length()) break;
-          }
-          if (!inner.empty()) segMap[row.first] = std::move(inner);
+          std::map<uint16_t, String> inner; String csv=row.second; uint16_t idx=0; int start=0;
+          while (start <= (int)csv.length()) { int comma=csv.indexOf(',',start); if (comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if (start>(int)csv.length()) break; }
+          if (!inner.empty()) segMap[row.first]=std::move(inner);
         }
-
-        // persist files
         if (!WLED_FS.exists(SKY_CFG_DIR)) { WLED_FS.mkdir(SKY_CFG_DIR); }
-        // 1) map.json
-        {
-          DynamicJsonDocument d(4096);
-          JsonObject rootObj = d.to<JsonObject>();
-          JsonObject map = rootObj.createNestedObject("map");
-          for (auto &segPair : segMap) {
-            const uint8_t seg = segPair.first;
-            const auto &idxMap = segPair.second;
-            uint16_t maxIdx = 0; for (const auto &kv : idxMap) if (kv.first > maxIdx) maxIdx = kv.first;
-            String csv; for (uint16_t i=0; i<=maxIdx; i++) { if (i) csv += ','; auto it = idxMap.find(i); if (it != idxMap.end()) csv += it->second; }
-            char key[6]; snprintf(key, sizeof(key), "%u", (unsigned)seg);
-            map[key] = csv;
-          }
-          File f = WLED_FS.open(SKY_MAP_PATH, "w"); bool ok = false; if (f){ ok = (serializeJson(d,f) > 0); f.close(); }
-          if (!ok) { r->send(500,"text/plain","map.json write failed"); return; }
-        }
-        // 2) config.json
-        {
-          DynamicJsonDocument pd(256); pd["mapProfile"]="Custom";
-          File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); }
-        }
-
-        r->send(200,"text/plain","ok");
-        return;
+        { DynamicJsonDocument d(4096); JsonObject rootObj=d.to<JsonObject>(); JsonObject map=rootObj.createNestedObject("map"); for (auto &segPair:segMap){ const uint8_t seg=segPair.first; const auto &idxMap=segPair.second; uint16_t maxIdx=0; for (const auto &kv:idxMap) if (kv.first>maxIdx) maxIdx=kv.first; String csv; for (uint16_t i=0;i<=maxIdx;i++){ if(i) csv+=','; auto it=idxMap.find(i); if(it!=idxMap.end()) csv+=it->second; } char key[6]; snprintf(key,sizeof(key),"%u",(unsigned)seg); map[key]=csv; } File f=WLED_FS.open(SKY_MAP_PATH,"w"); bool ok=false; if(f){ ok=(serializeJson(d,f)>0); f.close(); } if(!ok){ r->send(500,"text/plain","map.json write failed"); return; } }
+        { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
+        r->send(200,"text/plain","ok"); return;
       }
 
       // preset path
-      mapProfile = profile;
-      using namespace SkyAwarePreloads;
-      segMap.clear();
-      bool ok = false;
-      for (uint8_t i=0; i<PRESET_COUNT; i++) {
-        String pname = String(FPSTR(PRESETS[i].name));
-        if (!pname.equalsIgnoreCase(mapProfile)) continue;
-        const CsvMap* rows = PRESETS[i].rows;
-        for (uint8_t rix = 0; rix < PRESETS[i].count; rix++) {
-          uint8_t seg = pgm_read_byte(&rows[rix].segment);
-          const char* csvPtr = (const char*) pgm_read_ptr(&rows[rix].csv);
-          String csv = String(FPSTR(csvPtr));
-          std::map<uint16_t, String> inner;
-          uint16_t idx=0; int start=0;
-          while (start <= (int)csv.length()) {
-            int comma = csv.indexOf(',', start);
-            if (comma < 0) comma = csv.length();
-            String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
-            if (ap.length()) inner[idx] = ap;
-            idx++; start = comma + 1;
-            if (start > (int)csv.length()) break;
-          }
-          if (!inner.empty()) segMap[seg] = std::move(inner);
-        }
-        ok = true; break;
-      }
-      // persist only profile choice
+      mapProfile = profile; using namespace SkyAwarePreloads; segMap.clear(); bool ok=false;
+      for (uint8_t i=0;i<PRESET_COUNT;i++){ String pname=String(FPSTR(PRESETS[i].name)); if(!pname.equalsIgnoreCase(mapProfile)) continue; const CsvMap* rows=PRESETS[i].rows; for(uint8_t rix=0; rix<PRESETS[i].count; rix++){ uint8_t seg=pgm_read_byte(&rows[rix].segment); const char* csvPtr=(const char*)pgm_read_ptr(&rows[rix].csv); String csv=String(FPSTR(csvPtr)); std::map<uint16_t,String> inner; uint16_t idx=0; int start=0; while(start <= (int)csv.length()){ int comma=csv.indexOf(',',start); if(comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if(start>(int)csv.length()) break; } if(!inner.empty()) segMap[seg]=std::move(inner);} ok=true; break; }
       { DynamicJsonDocument pd(256); pd["mapProfile"]=mapProfile; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
       r->send(ok ? 200 : 404, "text/plain", ok ? "ok" : "preset not found");
     });
 
-    // ---- Stage-0 endpoints ----
+    // ---- Stage-0 metadata endpoint (UI pulls this)
     server.on("/json/skyaware", HTTP_GET, [this](AsyncWebServerRequest* r){ handleMeta(r); });
 
-    server.on("/skyaware/own", HTTP_POST, [this](AsyncWebServerRequest* r){
+    // ---- OWN / RELEASE (new path)
+    server.on("/skyaware.api/own", HTTP_POST, [this](AsyncWebServerRequest* r){
       String v; const int n=r->params();
       for (int i=0;i<n;i++){ auto* p=r->getParam(i); if(p && p->name()=="enable"){ v=p->value(); break; } }
-      if (!v.length()) { r->send(400,"text/plain","missing enable"); return; }
+      if (!v.length()) { r->send(400,"application/json","{\"ok\":false,\"err\":\"missing enable\"}"); return; }
       ownSegmentsEnabled = (v != "0");
       if (ownSegmentsEnabled) enforceOwnOn(); else enforceOwnOff();
-      r->send(200,"text/plain", ownSegmentsEnabled ? "owned" : "released");
+      r->send(200,"application/json", ownSegmentsEnabled ? "{\"ok\":true,\"state\":\"owned\"}" : "{\"ok\":true,\"state\":\"released\"}");
     });
 
-    // CSV export
-    server.on("/skyaware/csv", HTTP_GET,  [this](AsyncWebServerRequest* r){ sendCsv(r); });
-
-    // CSV import -> RAM only. Also switch profile to Custom (and persist config.json).
-    server.on("/skyaware/csv", HTTP_POST,
+    // ---- CSV export/import (new paths)
+    server.on("/skyaware.api/csv", HTTP_GET,  [this](AsyncWebServerRequest* r){ sendCsv(r); });
+    server.on("/skyaware.api/csv", HTTP_POST,
       [this](AsyncWebServerRequest* r){
         String *buf = (String*) r->_tempObject;
         if (!buf || buf->length() == 0) {
@@ -800,16 +710,9 @@ public:
           if (buf) { delete buf; r->_tempObject = nullptr; }
           return;
         }
-        String err;
-        bool ok = importCsvBody(*buf, err);
-        delete buf; r->_tempObject = nullptr;
+        String err; bool ok = importCsvBody(*buf, err); delete buf; r->_tempObject = nullptr;
         if (!ok) { r->send(400, "text/plain", err.length()?err:"parse error"); return; }
-
-        // switch to Custom so the UI becomes editable and shows imported map
-        mapProfile = "Custom";
-        { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom";
-          File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
-
+        mapProfile = "Custom"; { DynamicJsonDocument pd(256); pd["mapProfile"]="Custom"; File pf=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(pf){ serializeJson(pd,pf); pf.close(); } }
         r->send(200, "text/plain", "ok");
       },
       /* onUpload */ nullptr,
@@ -819,14 +722,37 @@ public:
         buf->concat((const char*)data, len);
       }
     );
+
+    // ---- Last-known category endpoints (new paths)
+    server.on("/skyaware.api/cat", HTTP_POST, [this](AsyncWebServerRequest* req){
+      String icao = req->hasArg("icao") ? req->arg("icao") : "";
+      String catS = req->hasArg("cat")  ? req->arg("cat")  : "";
+      String tsS  = req->hasArg("ts")   ? req->arg("ts")   : "";
+      icao.trim(); catS.trim(); tsS.trim();
+      if (icao.length()!=4 || catS.length()==0) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao or cat\"}"); return; }
+      SkyCat c = strToCat(catS); uint32_t ts = tsS.length()? (uint32_t)tsS.toInt() : sa_nowSeconds();
+      _catCache.upsert(icao.c_str(), c, ts);
+      DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
+
+    server.on("/skyaware.api/cat", HTTP_GET, [this](AsyncWebServerRequest* req){
+      String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim();
+      if (icao.length()!=4) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao\"}"); return; }
+      SkyCat c; uint32_t ts; DynamicJsonDocument d(256); d["icao"]=icao;
+      if (_catCache.get(icao.c_str(), c, ts)) { d["ok"]=true; d["cat"]=catToStr(c); d["updated"]=ts; }
+      else { d["ok"]=false; d["err"]="not_found"; }
+      String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
+
+    server.on("/skyaware.api/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
+      DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
+    });
   }
 
   // ---- Hooks ----
   void setup() override {
     if (!WLED_FS.exists(SKY_CFG_DIR)) { WLED_FS.mkdir(SKY_CFG_DIR); }
-    // Ensure we always have a profile file to read later
     { DynamicJsonDocument d(256); d["mapProfile"] = mapProfile; File f=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(f){ serializeJson(d,f); f.close(); } }
-
     if (initialized) return;
     enforceOwnOn();
     registerHTTP();
@@ -836,9 +762,13 @@ public:
   void loop() override {
     if (!initialized) return;
     if (ownSegmentsEnabled) enforceOwnOn();
+    // future: background fetcher can call _catCache.upsert(...)
   }
 
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
+
+private:
+  SkyCatCache _catCache; // bounded last-known categories
 };
 
 // Global instance + registration
