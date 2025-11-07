@@ -8,7 +8,7 @@
 //      GET  /skyaware.api/cat?icao=KHIO
 //      GET  /skyaware.api/cats
 // • /skyaware UI shows read-only L/I/M/V pills per LED row (grey if SKIP/no ICAO)
-// • **Repaint engine**: whenever categories or mappings change, repaint LEDs & the UI Color column
+// • **Repaint engine via ID-path**: all pixel writes use the same JSON state path as the UI "ID" button.
 //
 // -----------------------------------------------------------------------------
 // - Owns/releases segments (STATIC + FREEZE). Firmware repaints pixels from category cache.
@@ -31,6 +31,29 @@
 #include <vector>
 #include <time.h>
 #include "preloadmaps.h"   // namespace SkyAwarePreloads { PRESET_COUNT; struct CsvMap{uint8_t segment; const char* csv;}; PRESETS[] }
+
+// ======= helpers to mirror the ID button (JSON state path) ============
+static inline uint32_t hexToColor(const String& hex) {
+  String s = hex; s.trim(); s.replace("#","");
+  while (s.length() < 6) s = "0" + s;
+  uint32_t r = strtoul(s.substring(0,2).c_str(), nullptr, 16);
+  uint32_t g = strtoul(s.substring(2,4).c_str(), nullptr, 16);
+  uint32_t b = strtoul(s.substring(4,6).c_str(), nullptr, 16);
+  return RGBW32(r,g,b,0);
+}
+
+// Build {"seg":{"id":X,"i":[ idx,"HEX", idx,"HEX", ... ]}} and deserialize via WLED.
+static void applySegI_JSON(uint8_t segId, const std::vector<std::pair<uint16_t, String>>& pairs) {
+  size_t cap = 512 + pairs.size()*32;
+  DynamicJsonDocument d(cap);
+  JsonObject root = d.to<JsonObject>();
+  JsonObject seg = root.createNestedObject("seg");
+  seg["id"] = segId;
+  JsonArray i = seg.createNestedArray("i");
+  for (auto &p : pairs) { i.add(p.first); i.add(p.second); }
+  deserializeState(root, CALL_MODE_DIRECT_CHANGE);
+  stateUpdated(CALL_MODE_DIRECT_CHANGE);
+}
 
 #ifndef SKY_CFG_DIR
   #define SKY_CFG_DIR "/skyaware"
@@ -76,21 +99,17 @@ private:
   void writeAt(int idx,const char* icao4,SkyCat cat,uint32_t ts){ if(idx<0||idx>=SKY_CAT_CACHE_MAX||!icao4) return; strncpy(rec[idx].icao,icao4,4); rec[idx].icao[4]='\0'; rec[idx].cat=cat; rec[idx].updated=ts; }
 };
 
-// ================= Color mapping + repaint engine ===========================
+// ================= Color mapping ===========================
 static inline uint32_t colorForCat(SkyCat c){
   switch(c){
     case CAT_LIFR: return RGBW32(0xFF,0x3F,0xFF,0x00); // magenta
     case CAT_IFR:  return RGBW32(0xFF,0x4B,0x4B,0x00); // red
     case CAT_MVFR: return RGBW32(0x3A,0x68,0xFF,0x00); // blue
     case CAT_VFR:  return RGBW32(0x20,0xC1,0x5A,0x00); // green
-    default:       return RGBW32(0x40,0x40,0x40,0x00); // dim gray
+    default:       return RGBW32(0x00,0x00,0x00,0x00); // off
   }
 }
 static inline uint32_t colorOff(){ return RGBW32(0x00,0x00,0x00,0x00); }
-
-static inline void paintPixelGlobal(uint16_t globalIndex, uint32_t col){
-  strip.setPixelColor(globalIndex, col);
-}
 
 // ------------------- UI HTML (PROGMEM) -------------------
 // Adds a read-only L/I/M/V indicator column. Greyed if SKIP or no ICAO.
@@ -248,7 +267,7 @@ function segTable(seg, mapForSeg, editable){
         if (tr.classList.contains('skip')||tr.classList.contains('no-icao')) return;
         const currentHex = stripHash(rgb2hex(L.r||0,L.g||0,L.b||0));
         if (active && active.seg===seg.id && active.idx===L.i) { await restoreActive(); }
-        else { if (active) await restoreActive(); active={ seg: seg.id, idx: L.i, prevHex: currentHex }; await setLedHex(seg.id,L.i,"00FFFF"); armAutoClear(); }
+        else { if (active) await restoreActive(); active={ seg: seg.id, idx: L.i, prevHex: currentHex }; await setLedHex(seg.id,L.i("00FFFF")); armAutoClear(); }
         await refresh();
       }catch(e){ showErr(e.message); }
     };
@@ -344,7 +363,7 @@ document.getElementById('ownToggle').onchange = async (e) => {
     await jpost(`/skyaware/own?enable=${en?1:0}`);
     const meta = await jget('/json/skyaware');
     if (en) {
-      const segDefs = meta.segments.map(s => ({ id:s.id, fx:0, frz:true, col:[[WARM_HEX]] }));
+      const segDefs = meta.segments.map(s => ({ id:s.id, fx:0, frz:true, col:[["FFD278"]] }));
       await postState({ on:true, bri:255, seg: segDefs });
       const map = meta.map || {};
       for (const s of meta.segments) {
@@ -352,7 +371,7 @@ document.getElementById('ownToggle').onchange = async (e) => {
         const iArr = [];
         for (let li=0; li<s.len; li++){
           const v = (m[String(li)]||'').toUpperCase().trim();
-          if (v === 'SKIP') { iArr.push(li, OFF_HEX); }
+          if (v === 'SKIP') { iArr.push(li, "000000"); }
         }
         if (iArr.length) await postState({ seg:{ id:s.id, i:iArr } });
       }
@@ -383,7 +402,6 @@ document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/sk
 
 async function refreshCats(){
   try{
-    // Prefer new API; fall back to legacy if needed
     let r = await fetch('/skyaware.api/cats'); 
     if (!r.ok) r = await fetch('/skyaware/cats');
     if (!r.ok) return;
@@ -422,6 +440,17 @@ public:
   // User-facing profile name ("Custom" or PRESET)
   String mapProfile = "Custom";
 
+  // simple test blinker state (driven via ID-path)
+  struct {
+    bool active=false;
+    uint8_t seg=0;
+    uint16_t idx=0;
+    String h1, h2;
+    uint32_t periodMs=300, lastMs=0;
+    uint16_t remaining=0;
+    bool phase=false;
+  } _blink;
+
   void addToConfig(JsonObject& root) override { (void)root; } // no generic WLED UI
 
   bool readFromConfig(JsonObject& root) override {
@@ -456,7 +485,7 @@ public:
               uint16_t idx=0; int start=0;
               while (start <= (int)csv.length()) {
                 int comma = csv.indexOf(',', start);
-                if (comma < 0) comma = csv.length();   // FIXED
+                if (comma < 0) comma = csv.length();   // FIX
                 String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
                 if (ap == "-") ap = "SKIP";
                 if (ap.length()) inner[idx] = ap;
@@ -483,7 +512,7 @@ public:
           uint16_t idx=0; int start=0;
           while (start <= (int)csv.length()) {
             int comma = csv.indexOf(',', start);
-            if (comma < 0) comma = csv.length();   // FIXED
+            if (comma < 0) comma = csv.length();   // FIX
             String ap = csv.substring(start, comma); ap.trim(); ap.toUpperCase();
             if (ap.length()) inner[idx] = ap;
             idx++; start = comma + 1;
@@ -625,19 +654,18 @@ public:
   }
 
   // ---- Own/Release (no repaint) ----
-static inline void enforceOwnOn() {
-  if (!bri) bri = 255;
-  strip.setBrightness(bri);
-  const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
-  for (uint16_t i = 0; i < segCount; i++) {
-    Segment& s = strip.getSegment(i);
-    if (s.mode != FX_MODE_STATIC) s.setMode(FX_MODE_STATIC);
-    s.setOption(SEG_OPTION_FREEZE, true);  // stop the renderer from touching pixels
-    s.setOption(SEG_OPTION_ON, true);      // visible
-    s.setOpacity(255);
+  static inline void enforceOwnOn() {
+    if (!bri) bri = 255;
+    strip.setBrightness(bri);
+    const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
+    for (uint16_t i = 0; i < segCount; i++) {
+      Segment& s = strip.getSegment(i);
+      if (s.mode != FX_MODE_STATIC) s.setMode(FX_MODE_STATIC);
+      s.setOption(SEG_OPTION_FREEZE, true);  // stop the renderer from touching pixels
+      s.setOption(SEG_OPTION_ON, true);      // visible
+      s.setOpacity(255);
+    }
   }
-}
-
 
   static inline void enforceOwnOff() {
     const uint16_t segCount = strip.getLastActiveSegmentId() + 1;
@@ -647,50 +675,51 @@ static inline void enforceOwnOn() {
     }
   }
 
-  // ---------------- repaint helpers ----------------
+  // ---------------- repaint helpers: ID-PATH ----------------
   void repaintIcao(const String& icaoUpper){
-  // segments must already be owned/frozen/visible (see enforceOwnOn)
-  for (auto &segPair : segMap) {
-    uint8_t segId = segPair.first;
-    Segment& s = strip.getSegment(segId);
+    for (auto &segPair : segMap) {
+      uint8_t segId = segPair.first;
+      auto &inner = segPair.second;
 
-    for (auto &idxPair : segPair.second) {
-      const uint16_t li = idxPair.first;
-      const String& ap  = idxPair.second;
+      std::vector<std::pair<uint16_t, String>> updates;
+      for (auto &idxPair : inner) {
+        const uint16_t li = idxPair.first;
+        const String& ap  = idxPair.second;
 
-      if (ap.equalsIgnoreCase("SKIP")) { s.setPixelColor(li, colorOff()); continue; }
-      if (!ap.equalsIgnoreCase(icaoUpper)) continue;
+        if (ap.equalsIgnoreCase("SKIP")) { updates.emplace_back(li, String(F("000000"))); continue; }
+        if (!ap.equalsIgnoreCase(icaoUpper)) continue;
 
-      SkyCat cat; uint32_t ts;
-      SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
-      s.setPixelColor(li, colorForCat(c));  // write into your buffer (segment-local)
+        SkyCat cat; uint32_t ts;
+        SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
+        uint32_t col = colorForCat(c);
+        char hex[7]; snprintf(hex, sizeof(hex), "%02X%02X%02X", R(col), G(col), B(col));
+        updates.emplace_back(li, String(hex));
+      }
+      if (!updates.empty()) applySegI_JSON(segId, updates);
     }
   }
-  // IMPORTANT: don't call stateUpdated() here—just push the buffer
-  strip.show();
-}
 
-void repaintAllFromCats(){
-  const uint16_t lastSegId = strip.getLastActiveSegmentId();
-  for (uint16_t si = 0; si <= lastSegId; si++) {
-    Segment& s = strip.getSegment(si);
-    auto it = segMap.find((uint8_t)si);
-    if (it == segMap.end()) continue;
+  void repaintAllFromCats(){
+    const uint16_t lastSegId = strip.getLastActiveSegmentId();
+    for (uint16_t si = 0; si <= lastSegId; si++) {
+      auto it = segMap.find((uint8_t)si);
+      if (it == segMap.end()) continue;
 
-    for (auto &idxPair : it->second) {
-      const uint16_t li = idxPair.first;
-      const String& ap  = idxPair.second;
+      std::vector<std::pair<uint16_t, String>> updates;
+      for (auto &idxPair : it->second) {
+        const uint16_t li = idxPair.first;
+        const String& ap  = idxPair.second;
 
-      if (ap.equalsIgnoreCase("SKIP")) { s.setPixelColor(li, colorOff()); continue; }
-      SkyCat cat; uint32_t ts;
-      SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
-      s.setPixelColor(li, colorForCat(c));
+        if (ap.equalsIgnoreCase("SKIP")) { updates.emplace_back(li, String(F("000000"))); continue; }
+        SkyCat cat; uint32_t ts;
+        SkyCat c = _catCache.get(ap.c_str(), cat, ts) ? cat : CAT_UNKNOWN;
+        uint32_t col = colorForCat(c);
+        char hex[7]; snprintf(hex, sizeof(hex), "%02X%02X%02X", R(col), G(col), B(col));
+        updates.emplace_back(li, String(hex));
+      }
+      if (!updates.empty()) applySegI_JSON((uint8_t)si, updates);
     }
   }
-  // Push only
-  strip.show();
-}
-
 
   void registerHTTP() {
     // ---- UI ----
@@ -743,7 +772,7 @@ void repaintAllFromCats(){
         mapProfile = "Custom"; segMap.clear();
         for (auto &row : csvRows) {
           std::map<uint16_t, String> inner; String csv=row.second; uint16_t idx=0; int start=0;
-          while (start <= (int)csv.length()) { int comma=csv.indexOf(',',start); if (comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if (start>(int)csv.length()) break; }  // FIXED
+          while (start <= (int)csv.length()) { int comma=csv.indexOf(',',start); if (comma<0) comma=csv.length(); String ap=csv.substring(start,comma); ap.trim(); ap.toUpperCase(); if (ap=="-") ap="SKIP"; if (ap.length()) inner[idx]=ap; idx++; start=comma+1; if (start>(int)csv.length()) break; }
           if (!inner.empty()) segMap[row.first]=std::move(inner);
         }
         if (!WLED_FS.exists(SKY_CFG_DIR)) { WLED_FS.mkdir(SKY_CFG_DIR); }
@@ -761,7 +790,7 @@ void repaintAllFromCats(){
       r->send(ok ? 200 : 404, "text/plain", ok ? "ok" : "preset not found");
     });
 
-    // ---- Stage-0 endpoints ----
+    // ---- Stage-0 meta ----
     server.on("/json/skyaware", HTTP_GET, [this](AsyncWebServerRequest* r){ handleMeta(r); });
 
     server.on("/skyaware/own", HTTP_POST, [this](AsyncWebServerRequest* r){
@@ -822,28 +851,55 @@ void repaintAllFromCats(){
       DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
 
-    // ---- Legacy mirrors for dev convenience ----
-    server.on("/skyaware/cat", HTTP_POST, [this](AsyncWebServerRequest* req){
-      String icao = req->hasArg("icao") ? req->arg("icao") : "";
-      String catS = req->hasArg("cat")  ? req->arg("cat")  : "";
-      String tsS  = req->hasArg("ts")   ? req->arg("ts")   : "";
-      icao.trim(); catS.trim(); tsS.trim(); icao.toUpperCase();
-      if (icao.length()!=4 || catS.length()==0) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao or cat\"}"); return; }
-      SkyCat c = strToCat(catS); uint32_t ts = tsS.length()? (uint32_t)tsS.toInt() : sa_nowSeconds();
-      _catCache.upsert(icao.c_str(), c, ts);
-      repaintIcao(icao);
-      DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
+    // ---- Test endpoints: ID-path painting ----
+    server.on("/skyaware.api/test/paint", HTTP_GET, [this](AsyncWebServerRequest* req){
+      uint8_t seg = req->hasArg("seg") ? (uint8_t) strtoul(req->arg("seg").c_str(), nullptr, 10) : 0;
+      uint16_t idx = req->hasArg("idx") ? (uint16_t) strtoul(req->arg("idx").c_str(), nullptr, 10) : 0;
+      String hex = req->hasArg("hex") ? req->arg("hex") : "00FFFF";
+      const uint16_t lastSegId = strip.getLastActiveSegmentId();
+      if (seg > lastSegId) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad seg\"}"); return; }
+      if (idx >= strip.getSegment(seg).length()) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad idx\"}"); return; }
+      applySegI_JSON(seg, {{ idx, hex }});
+      req->send(200,"application/json","{\"ok\":true}");
     });
-    server.on("/skyaware/cat", HTTP_GET, [this](AsyncWebServerRequest* req){
-      String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim(); icao.toUpperCase();
-      if (icao.length()!=4) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao\"}"); return; }
-      SkyCat c; uint32_t ts; DynamicJsonDocument d(256); d["icao"]=icao;
-      if (_catCache.get(icao.c_str(), c, ts)) { d["ok"]=true; d["cat"]=catToStr(c); d["updated"]=ts; }
-      else { d["ok"]=false; d["err"]="not_found"; }
-      String out; serializeJson(d,out); req->send(200, "application/json", out);
+
+    server.on("/skyaware.api/test/fill", HTTP_GET, [this](AsyncWebServerRequest* req){
+      uint8_t seg = req->hasArg("seg") ? (uint8_t) strtoul(req->arg("seg").c_str(), nullptr, 10) : 0;
+      uint16_t from = req->hasArg("from") ? (uint16_t) strtoul(req->arg("from").c_str(), nullptr, 10) : 0;
+      uint16_t count = req->hasArg("count") ? (uint16_t) strtoul(req->arg("count").c_str(), nullptr, 10) : 1;
+      String hex = req->hasArg("hex") ? req->arg("hex") : "00FF00";
+      const uint16_t lastSegId = strip.getLastActiveSegmentId();
+      if (seg > lastSegId) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad seg\"}"); return; }
+      Segment& s = strip.getSegment(seg);
+      if (from >= s.length()) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad from\"}"); return; }
+      uint16_t to = from + count; if (to > s.length()) to = s.length();
+      std::vector<std::pair<uint16_t, String>> updates;
+      updates.reserve(to - from);
+      for (uint16_t i = from; i < to; i++) updates.emplace_back(i, hex);
+      applySegI_JSON(seg, updates);
+      req->send(200,"application/json","{\"ok\":true}");
     });
-    server.on("/skyaware/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
-      DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
+
+    server.on("/skyaware.api/test/blink", HTTP_GET, [this](AsyncWebServerRequest* req){
+      uint8_t seg = req->hasArg("seg") ? (uint8_t) strtoul(req->arg("seg").c_str(), nullptr, 10) : 0;
+      uint16_t idx = req->hasArg("idx") ? (uint16_t) strtoul(req->arg("idx").c_str(), nullptr, 10) : 0;
+      String h1 = req->hasArg("hex1") ? req->arg("hex1") : "FF0000";
+      String h2 = req->hasArg("hex2") ? req->arg("hex2") : "0000FF";
+      uint32_t ms = req->hasArg("ms")  ? (uint32_t) strtoul(req->arg("ms").c_str(), nullptr, 10) : 300;
+      uint16_t n  = req->hasArg("n")   ? (uint16_t) strtoul(req->arg("n").c_str(), nullptr, 10) : 16;
+      const uint16_t lastSegId = strip.getLastActiveSegmentId();
+      if (seg > lastSegId) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad seg\"}"); return; }
+      if (idx >= strip.getSegment(seg).length()) { req->send(400,"application/json","{\"ok\":false,\"err\":\"bad idx\"}"); return; }
+      applySegI_JSON(seg, {{ idx, h2 }}); // prime with second color
+      _blink.active = true; _blink.seg=seg; _blink.idx=idx;
+      _blink.h1=h1; _blink.h2=h2; _blink.periodMs=ms; _blink.remaining=n;
+      _blink.lastMs = millis(); _blink.phase=false;
+      req->send(200,"application/json","{\"ok\":true}");
+    });
+
+    server.on("/skyaware.api/repaint", HTTP_POST, [this](AsyncWebServerRequest* req){
+      repaintAllFromCats();
+      req->send(200,"application/json","{\"ok\":true}");
     });
   }
 
@@ -853,7 +909,6 @@ void repaintAllFromCats(){
     { DynamicJsonDocument d(256); d["mapProfile"] = mapProfile; File f=WLED_FS.open(SKY_PROFILE_PATH,"w"); if(f){ serializeJson(d,f); f.close(); } }
     if (initialized) return;
 
-    // Ensure device is on and bright prior to first paint
     if (!bri) bri = 255;
     strip.setBrightness(bri);
     stateUpdated(CALL_MODE_DIRECT_CHANGE);
@@ -867,7 +922,20 @@ void repaintAllFromCats(){
   void loop() override {
     if (!initialized) return;
     if (ownSegmentsEnabled) enforceOwnOn();
-    // future: background fetcher can call _catCache.upsert(...) then repaintIcao(...)
+
+    // drive test blinker using the same ID path
+    if (_blink.active) {
+      uint32_t now = millis();
+      if (now - _blink.lastMs >= _blink.periodMs) {
+        _blink.lastMs = now;
+        _blink.phase = !_blink.phase;
+        applySegI_JSON(_blink.seg, {{ _blink.idx, _blink.phase ? _blink.h1 : _blink.h2 }});
+        if (_blink.remaining > 0) {
+          _blink.remaining--;
+          if (_blink.remaining == 0) _blink.active = false;
+        }
+      }
+    }
   }
 
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
