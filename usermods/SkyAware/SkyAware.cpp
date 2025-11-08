@@ -108,11 +108,12 @@ private:
 // ================= Color mapping ===========================
 static inline uint32_t colorForCat(SkyCat c){
   switch(c){
-    case CAT_LIFR: return RGBW32(0xFF,0x3F,0xFF,0x00); // magenta
-    case CAT_IFR:  return RGBW32(0xFF,0x4B,0x4B,0x00); // red
-    case CAT_MVFR: return RGBW32(0x3A,0x68,0xFF,0x00); // blue
-    case CAT_VFR:  return RGBW32(0x20,0xC1,0x5A,0x00); // green
-    default:       return RGBW32(0x00,0x00,0x00,0x00); // off
+      case CAT_LIFR: return RGBW32(0xFF,0x00,0xFF,0x00); // magenta
+      case CAT_IFR:  return RGBW32(0xFF,0x00,0x00,0x00); // red
+      case CAT_MVFR: return RGBW32(0x00,0x00,0xFF,0x00); // blue
+      case CAT_VFR:  return RGBW32(0x00,0xFF,0x00,0x00); // green
+      default:       return RGBW32(0x00,0x00,0x00,0x00); // off
+
   }
 }
 static inline uint32_t colorOff(){ return RGBW32(0x00,0x00,0x00,0x00); }
@@ -910,6 +911,7 @@ public:
       repaintIcao(icao);
       DynamicJsonDocument d(256); d["ok"]=true; d["icao"]=icao; d["cat"]=catToStr(c); d["updated"]=ts; String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
+
     server.on("/skyaware.api/cat", HTTP_GET, [this](AsyncWebServerRequest* req){
       String icao = req->hasArg("icao") ? req->arg("icao") : ""; icao.trim(); icao.toUpperCase();
       if (icao.length()!=4) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"missing icao\"}"); return; }
@@ -918,9 +920,19 @@ public:
       else { d["ok"]=false; d["err"]="not_found"; }
       String out; serializeJson(d,out); req->send(200, "application/json", out);
     });
-    server.on("/skyaware.api/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
-      DynamicJsonDocument d(1024); d["ok"]=true; _catCache.toJson(d); String out; serializeJson(d,out); req->send(200, "application/json", out);
-    });
+
+// roomy buffer so we don't truncate big airport sets
+server.on("/skyaware.api/cats", HTTP_GET, [this](AsyncWebServerRequest* req){
+  // ~96 bytes/record is a safe overestimate (icao, cat, updated + structure)
+  const size_t cap = 256 + ((size_t)_catCache.size() + 1) * 96;
+  DynamicJsonDocument d(cap > 16384 ? cap : 16384);
+  d["ok"] = true;
+  _catCache.toJson(d);   // <-- uses the public API; no private access
+  String out; serializeJson(d, out);
+  auto* res = req->beginResponse(200, "application/json", out);
+  res->addHeader("Cache-Control","no-store");
+  req->send(res);
+});
 
     // ---- Test endpoints: ID-path painting ----
     server.on("/skyaware.api/test/paint", HTTP_GET, [this](AsyncWebServerRequest* req){

@@ -9,6 +9,8 @@
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <time.h>   // for time(), mktime(), struct tm
+#include <ctype.h>  // for isdigit
 
 // ===== lwIP DNS (ESP32) =====
 #if defined(ARDUINO_ARCH_ESP32)
@@ -67,7 +69,7 @@ static SAF_Settings         g_cfg;
 static void*                g_ctx = nullptr;
 static SAF_CollectIcaosFn   g_collect = nullptr;
 static SAF_ApplyCategoryFn  g_apply   = nullptr;
-static uint32_t             g_nextDue = 0;
+static uint32_t             g_nextDue = 0;  // millis() timestamp when next step/cycle allowed
 
 // Work queue
 static std::vector<String>  g_cycleIcaos;
@@ -295,6 +297,36 @@ static bool httpGetJsonHttpsDnsFallback(const String& urlIn, String& outBody, in
 }
 
 // -------------------- JSON parsing (AWC) + fallback scanner --------------------
+
+// tiny helper: parse "YYYY-MM-DDTHH:MM:SS(.sss)Z" to epoch seconds (UTC)
+static uint32_t parseIsoUtcToEpoch(const char* iso) {
+  if (!iso || !*iso) return 0;
+  int Y,M,D,h,m,s;
+  if (sscanf(iso, "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&s) != 6) return 0;
+  struct tm tmv; memset(&tmv, 0, sizeof(tmv));
+  tmv.tm_year = Y - 1900; tmv.tm_mon = M - 1; tmv.tm_mday = D;
+  tmv.tm_hour = h; tmv.tm_min = m; tmv.tm_sec = s;
+  // On ESP32, mktime() assumes local TZ; WLED typically uses UTC.
+  // Even if TZ is local, this is close enough for "last updated" display.
+  time_t t = mktime(&tmv);
+  return (t > 0) ? (uint32_t)t : 0;
+}
+
+// scan forward from 'from' to find "obsTime":<digits> and return that value
+static uint32_t scanObsTimeNear(const String& s, size_t from) {
+  size_t k = s.indexOf("\"obsTime\":", from);
+  if (k == (size_t)-1) return 0;
+  k += 10; // after the colon
+  while (k < s.length() && (s[k]==' '||s[k]=='\t')) k++;
+  size_t e = k;
+  while (e < s.length() && isdigit((int)s[e])) e++;
+  if (e > k) {
+    uint32_t val = (uint32_t) strtoul(s.substring(k,e).c_str(), nullptr, 10);
+    if (val > 100000000U) return val; // sanity check for epoch-like
+  }
+  return 0;
+}
+
 static uint16_t parseAwcByScan(const String& s) {
   uint16_t applied = 0;
   size_t pos = 0;
@@ -303,46 +335,42 @@ static uint16_t parseAwcByScan(const String& s) {
   while (true) {
     // Prefer AWC names: "icaoId":"XXXX"
     size_t k1 = s.indexOf("\"icaoId\":\"", pos);
+    bool legacy = false;
     if (k1 == (size_t)-1) {
       // try legacy "station":"XXXX"
       k1 = s.indexOf("\"station\":\"", pos);
       if (k1 == (size_t)-1) break;
-      size_t v1 = k1 + 11; // len("\"station\":\"")
-      size_t e1 = s.indexOf('"', v1); if (e1==(size_t)-1) break;
-      String icao = up(s.substring(v1, e1));
-
-      size_t k2 = s.indexOf("\"flight_category\":\"", e1);
-      if (k2 == (size_t)-1) { pos = e1; continue; }
-      size_t v2 = k2 + 19; // len("\"flight_category\":\"")
-      size_t e2 = s.indexOf('"', v2); if (e2==(size_t)-1) break;
-      String cat = up(s.substring(v2, e2));
-
-      if (icao.length()==4 && cat.length()>0) {
-        if (g_logLevel >= 3) saf_logf(3, "[APPLY] %s -> %s (scan)", icao.c_str(), cat.c_str());
-        if (g_apply) g_apply(g_ctx, icao, cat, saf_nowSec());
-        applied++;
-      }
-      pos = e2;
-      continue;
+      legacy = true;
     }
 
-    // AWC fields
-    size_t v1 = k1 + 10; // len("\"icaoId\":\"")
+    size_t v1 = k1 + (legacy ? 11 : 10);
     size_t e1 = s.indexOf('"', v1); if (e1==(size_t)-1) break;
     String icao = up(s.substring(v1, e1));
 
-    size_t k2 = s.indexOf("\"fltCat\":\"", e1);
-    if (k2 == (size_t)-1) { pos = e1; continue; }
-    size_t v2 = k2 + 10; // len("\"fltCat\":\"")
-    size_t e2 = s.indexOf('"', v2); if (e2==(size_t)-1) break;
-    String cat = up(s.substring(v2, e2));
+    // category
+    String cat;
+    if (legacy) {
+      size_t k2 = s.indexOf("\"flight_category\":\"", e1);
+      if (k2 != (size_t)-1) {
+        size_t v2 = k2 + 19; size_t e2 = s.indexOf('"', v2); if (e2!=(size_t)-1) cat = up(s.substring(v2, e2));
+      }
+    } else {
+      size_t k2 = s.indexOf("\"fltCat\":\"", e1);
+      if (k2 != (size_t)-1) {
+        size_t v2 = k2 + 10; size_t e2 = s.indexOf('"', v2); if (e2!=(size_t)-1) cat = up(s.substring(v2, e2));
+      }
+    }
+
+    // timestamp: try obsTime nearby; else now
+    uint32_t ts = scanObsTimeNear(s, e1);
+    if (ts == 0) ts = saf_nowSec();
 
     if (icao.length()==4 && cat.length()>0) {
-      if (g_logLevel >= 3) saf_logf(3, "[APPLY] %s -> %s (scan)", icao.c_str(), cat.c_str());
-      if (g_apply) g_apply(g_ctx, icao, cat, saf_nowSec());
+      if (g_logLevel >= 3) saf_logf(3, "[APPLY] %s -> %s ts=%u (scan)", icao.c_str(), cat.c_str(), (unsigned)ts);
+      if (g_apply) g_apply(g_ctx, icao, cat, ts);
       applied++;
     }
-    pos = e2;
+    pos = e1 + 1;
   }
   return applied;
 }
@@ -381,12 +409,20 @@ static uint16_t parseAwcApiMetars(const String& body) {
 
     icao.trim(); icao.toUpperCase();
     cat.trim();  cat.toUpperCase();
+    if (icao.length()!=4 || cat.length()==0) continue;
 
-    if (icao.length()==4 && cat.length()>0) {
-      if (g_logLevel >= 3) saf_logf(3, "[APPLY] %s -> %s", icao.c_str(), cat.c_str());
-      if (g_apply) g_apply(g_ctx, icao, cat, saf_nowSec());
-      applied++;
+    // --- choose a timestamp (prefer AWC epoch obsTime) ---
+    uint32_t ts = 0;
+    if (v["obsTime"].is<uint32_t>()) {
+      ts = v["obsTime"].as<uint32_t>();
+    } else if (v["reportTime"].is<const char*>()) {
+      ts = parseIsoUtcToEpoch(v["reportTime"].as<const char*>());
     }
+    if (ts == 0) ts = saf_nowSec();
+
+    if (g_logLevel >= 3) saf_logf(3, "[APPLY] %s -> %s ts=%u", icao.c_str(), cat.c_str(), (unsigned)ts);
+    if (g_apply) g_apply(g_ctx, icao, cat, ts);
+    applied++;
   }
   return applied;
 }
@@ -476,10 +512,16 @@ static void registerHttp(AsyncWebServer& server) {
 
   // diag
   server.on("/skyaware.metar/diag", HTTP_GET, [](AsyncWebServerRequest* req){
-    DynamicJsonDocument d(1024);
+    DynamicJsonDocument d(1536);
+    const uint32_t nowMs = millis();
+    uint32_t eta = 0;
+    if (!g_inFlight && g_cfg.enable) {
+      eta = (g_nextDue > nowMs) ? (g_nextDue - nowMs) : 0;
+    }
     d["ok"] = true;
     d["inFlight"] = g_inFlight;
-    d["nextDueMs"] = g_nextDue;
+    d["etaMs"]    = eta;            // countdown to next fetch when idle
+    d["nextDueMs"]= g_nextDue;      // raw millis timestamp (debug)
     d["cyclePos"]  = (uint32_t)g_cyclePos;
     d["cycleSize"] = (uint32_t)g_cycleIcaos.size();
     d["cycles"]    = g_cycles;
