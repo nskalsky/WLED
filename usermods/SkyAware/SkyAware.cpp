@@ -204,6 +204,19 @@ tr.skip .pills, tr.no-icao .pills { opacity:.35; filter:grayscale(90%); }
           Enable METAR Queries
         </label>
         <div class="small muted">Defaults: disabled, every 2.5 min, 10 airports/batch.</div>
+        <!-- Status + metrics -->
+        <div id="metarStatus" class="small" style="margin-top:6px">
+          <span class="muted">Status:</span>
+          <span id="metarStatusText">—</span>
+        </div>
+        <div id="metarMetrics" class="small muted" style="margin-top:4px">
+          Runs <span id="mxRuns">0</span> •
+          OK <span id="mxOk">0</span> •
+          Partial <span id="mxPartial">0</span> •
+          Fail <span id="mxFail">0</span>
+          <span id="mxLast" class="muted" style="margin-left:8px"></span>
+        </div>
+
       </div>
       <div class="row" style="gap:10px">
         <label>Frequency (ms)
@@ -212,6 +225,7 @@ tr.skip .pills, tr.no-icao .pills { opacity:.35; filter:grayscale(90%); }
         <label>Batch size
           <input id="metarBatch" type="number" min="1" max="50" value="10" style="width:90px">
         </label>
+        <button id="metarForce">Fetch now</button>
         <button id="metarSave">Save</button>
       </div>
     </div>
@@ -431,6 +445,46 @@ document.getElementById('csvFile').addEventListener('change', async (ev)=>{
 
 document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware/csv'; };
 
+
+// ---- METAR diag countdown & metrics ----
+let __metarPollTimer = null;
+function fmtEta(ms){ if(ms<=0) return "now"; const s=Math.ceil(ms/1000); if(s<60) return `${s}s`; const m=Math.floor(s/60),r=s%60; return r?`${m}m ${r}s`:`${m}m`; }
+async function pollMetarDiagOnce(){
+  const lbl = document.getElementById('metarStatusText');
+  const btn = document.getElementById('metarForce');
+  const en  = document.getElementById('metarEnable')?.checked;
+  if (!en){
+    if(lbl) lbl.textContent = 'disabled';
+    if(btn) btn.disabled = true;
+    return;
+  }
+  try{
+    const r = await fetch('/skyaware.metar/diag', {cache:'no-store'});
+    if(!r.ok) throw new Error(String(r.status));
+    const j = await r.json();
+    const inFlight = !!j.inFlight;
+    const etaMs = Number(j.etaMs||0);
+    if(lbl) lbl.textContent = inFlight ? 'fetching…' : `next fetch in ${fmtEta(etaMs)}`;
+    if(btn) btn.disabled = inFlight;
+    // metrics
+    if (document.getElementById('mxRuns')) {
+      document.getElementById('mxRuns').textContent    = Number(j.runs||j.okCycles||0); // fallback
+      document.getElementById('mxOk').textContent      = Number(j.okCycles||0);
+      document.getElementById('mxPartial').textContent = Number(j.partial||0);
+      document.getElementById('mxFail').textContent    = Number(j.fail||0);
+      document.getElementById('mxLast').textContent    = j.lastNote ? `• Last: ${j.lastNote}` : '';
+    }
+  }catch(e){
+    if(lbl) lbl.textContent = 'status unavailable';
+    if(btn) btn.disabled = false;
+  }
+}
+function startMetarPolling(){
+  if(__metarPollTimer) clearInterval(__metarPollTimer);
+  __metarPollTimer = setInterval(pollMetarDiagOnce, 1000);
+  pollMetarDiagOnce();
+}
+
 // ---- METAR settings load/save ----
 async function loadMetarSettings(){
   try{
@@ -441,6 +495,8 @@ async function loadMetarSettings(){
   }catch(e){
     // optional: showErr('METAR status: ' + e.message);
   }
+
+  startMetarPolling();
 }
 
 document.getElementById('metarSave').onclick = async ()=>{
@@ -464,6 +520,21 @@ document.getElementById('metarSave').onclick = async ()=>{
     showErr('Save failed: ' + e.message);
   }
 };
+
+// Wire Fetch now and enable toggle
+document.addEventListener('DOMContentLoaded', ()=>{
+  const fb=document.getElementById('metarForce');
+  if(fb){ fb.addEventListener('click', async ()=>{
+    try{
+      const r=await fetch('/skyaware.metar/force', {method:'POST'});
+      // reflect active state immediately
+      pollMetarDiagOnce();
+    }catch(e){ /* ignore */ }
+  }); }
+  const en=document.getElementById('metarEnable');
+  if(en){ en.addEventListener('change', startMetarPolling); }
+});
+
 
 async function refreshCats(){
   try{

@@ -85,6 +85,15 @@ static String   g_lastErr;
 static uint32_t g_lastRunMs  = 0;
 static uint32_t g_cycles     = 0;
 static String   g_lastBodySample;
+// metrics
+static uint32_t g_mxRuns = 0;
+static uint32_t g_mxOk = 0;
+static uint32_t g_mxPartial = 0;
+static uint32_t g_mxFail = 0;
+static uint16_t g_cycleRequested = 0;
+static uint16_t g_cycleUpdated = 0;
+static String   g_mxLastNote;
+
 
 // ------------- DNS strategy -------------
 enum SAF_DnsMode : uint8_t { DNS_DHCP_FIRST=0, DNS_GOOGLE_FIRST=1 };
@@ -540,7 +549,14 @@ static void registerHttp(AsyncWebServer& server) {
       size_t idx = (g_logIdx + SAF_LOG_CAP - i) % SAF_LOG_CAP;
       tail.add(g_logRing[idx]);
     }
-    String out; serializeJson(d, out);
+    
+    // metrics
+    d["runs"]    = g_mxRuns;
+    d["okCycles"]= g_mxOk;
+    d["partial"] = g_mxPartial;
+    d["fail"]    = g_mxFail;
+    d["lastNote"]= g_mxLastNote;
+String out; serializeJson(d, out);
     auto* res = req->beginResponse(200, "application/json", out);
     res->addHeader("Cache-Control","no-store");
     req->send(res);
@@ -597,6 +613,9 @@ void MetarFetcher_tick(void* /*ctx*/) {
     g_cyclePos = 0;
     g_inFlight = true;
     g_cycles++;
+    g_cycleRequested = 0;
+    g_cycleUpdated = 0;
+
     if (g_cycleIcaos.empty()) {
       saf_logf(1, "[METAR] cycle: no ICAOs -> sleep %u ms", (unsigned)g_cfg.freqMs);
       g_inFlight = false;
@@ -644,6 +663,12 @@ void MetarFetcher_tick(void* /*ctx*/) {
     uint16_t cnt = parseAwcApiMetars(body);
     g_lastMetarCount = cnt;
     saf_logf(1, "[METAR] parsed=%u applied=%u", (unsigned)cnt, (unsigned)cnt);
+    // metrics accumulate
+    g_cycleRequested += (uint16_t)(to - from);
+    if (ok && g_lastHttpCode==200) {
+      g_cycleUpdated += cnt;
+    }
+
   }
 
   // Advance
@@ -651,7 +676,14 @@ void MetarFetcher_tick(void* /*ctx*/) {
 
   if (g_cyclePos >= N) {
     saf_logf(1, "[METAR] cycle done; next in %u ms", (unsigned)g_cfg.freqMs);
-    g_inFlight = false;
+    
+    // finalize metrics
+    g_mxRuns++;
+    if (g_cycleRequested == 0) { g_mxFail++; g_mxLastNote = String("0/0 (empty)"); }
+    else if (g_cycleUpdated == 0) { g_mxFail++; g_mxLastNote = String("0/") + String(g_cycleRequested); }
+    else if (g_cycleUpdated < g_cycleRequested) { g_mxPartial++; g_mxLastNote = String(g_cycleUpdated) + "/" + String(g_cycleRequested); }
+    else { g_mxOk++; g_mxLastNote = String(g_cycleUpdated) + "/" + String(g_cycleRequested); }
+g_inFlight = false;
     g_cycleIcaos.clear();
     g_nextDue = now + g_cfg.freqMs;
   } else {
