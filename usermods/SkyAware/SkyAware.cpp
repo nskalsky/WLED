@@ -31,6 +31,12 @@
 #include <vector>
 #include <time.h>
 #include "preloadmaps.h"   // namespace SkyAwarePreloads { PRESET_COUNT; struct CsvMap{uint8_t segment; const char* csv;}; PRESETS[] }
+#include "MetarFetcher.h"
+
+// Prototypes so we can pass them to MetarFetcher_begin() in setup()
+static void cbCollectIcaos(void* ctx, std::vector<String>& out);
+static void cbApplyCategory(void* ctx, const String& icaoUpper, const String& catStr, uint32_t ts);
+
 
 // ======= helpers to mirror the ID button (JSON state path) ============
 static inline uint32_t hexToColor(const String& hex) {
@@ -113,6 +119,7 @@ static inline uint32_t colorOff(){ return RGBW32(0x00,0x00,0x00,0x00); }
 
 // ------------------- UI HTML (PROGMEM) -------------------
 // Adds a read-only L/I/M/V indicator column. Greyed if SKIP or no ICAO.
+// Includes METAR Settings panel.
 static const char SKYAWARE_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html lang="en">
@@ -134,7 +141,7 @@ table{width:100%;border-collapse:collapse}
 th,td{padding:8px;border-bottom:1px solid #262b3c;text-align:left}
 .sw{display:inline-block;width:16px;height:16px;border-radius:4px;border:1px solid #2c3450;margin-right:8px;vertical-align:middle}
 .badge-on{background:#203a20;border-color:#2a5a2a;color:#a9e6a9}
-input[type=text], select{background:#20263a;border:1px solid #2c3450;border-radius:6px;color:var(--text);padding:6px 8px;min-width:160px}
+input[type=text], input[type=number], select{background:#20263a;border:1px solid #2c3450;border-radius:6px;color:var(--text);padding:6px 8px;min-width:160px}
 input[readonly]{ background:#1a2030; color:#9aa3b2; cursor:not-allowed; }
 .err{white-space:pre-wrap;background:#241a1a;border:1px solid #4a2d2d;color:#ffd6d6;border-radius:10px;padding:10px;margin-bottom:10px;display:none}
 input[type="file"]{display:none}
@@ -182,6 +189,29 @@ tr.skip .pills, tr.no-icao .pills { opacity:.35; filter:grayscale(90%); }
         <input id="csvFile" type="file" accept=".csv" />
         <label class="filebtn" for="csvFile">Import CSV</label>
         <button id="exportCsv">Export CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- METAR Settings -->
+  <div class="card">
+    <div class="row" style="align-items:flex-end">
+      <div>
+        <div class="small muted">METAR Queries</div>
+        <label>
+          <input id="metarEnable" type="checkbox" />
+          Enable METAR Queries
+        </label>
+        <div class="small muted">Defaults: disabled, every 2.5 min, 10 airports/batch.</div>
+      </div>
+      <div class="row" style="gap:10px">
+        <label>Frequency (ms)
+          <input id="metarFreq" type="number" min="15000" step="1000" value="150000" style="width:120px">
+        </label>
+        <label>Batch size
+          <input id="metarBatch" type="number" min="1" max="50" value="10" style="width:90px">
+        </label>
+        <button id="metarSave">Save</button>
       </div>
     </div>
   </div>
@@ -267,7 +297,7 @@ function segTable(seg, mapForSeg, editable){
         if (tr.classList.contains('skip')||tr.classList.contains('no-icao')) return;
         const currentHex = stripHash(rgb2hex(L.r||0,L.g||0,L.b||0));
         if (active && active.seg===seg.id && active.idx===L.i) { await restoreActive(); }
-        else { if (active) await restoreActive(); active={ seg: seg.id, idx: L.i, prevHex: currentHex }; await setLedHex(seg.id,L.i("00FFFF")); armAutoClear(); }
+        else { if (active) await restoreActive(); active={ seg: seg.id, idx: L.i, prevHex: currentHex }; await setLedHex(seg.id, L.i, "00FFFF"); armAutoClear(); }
         await refresh();
       }catch(e){ showErr(e.message); }
     };
@@ -400,6 +430,40 @@ document.getElementById('csvFile').addEventListener('change', async (ev)=>{
 
 document.getElementById('exportCsv').onclick = ()=>{ window.location.href = '/skyaware/csv'; };
 
+// ---- METAR settings load/save ----
+async function loadMetarSettings(){
+  try{
+    const j = await jget('/skyaware.metar/status');
+    document.getElementById('metarEnable').checked = !!j.enable;
+    document.getElementById('metarFreq').value     = Number(j.freqMs||150000);
+    document.getElementById('metarBatch').value    = Number(j.batch||10);
+  }catch(e){
+    // optional: showErr('METAR status: ' + e.message);
+  }
+}
+
+document.getElementById('metarSave').onclick = async ()=>{
+  try{
+    const en  = document.getElementById('metarEnable').checked ? '1' : '0';
+    const freq= Math.max(15000, parseInt(document.getElementById('metarFreq').value||'150000',10));
+    let batch = parseInt(document.getElementById('metarBatch').value||'10',10);
+    if (!Number.isFinite(batch) || batch < 1) batch = 1;
+    if (batch > 50) batch = 50;
+
+    const qs = new URLSearchParams();
+    qs.set('enable', en);
+    qs.set('freqMs', String(freq));
+    qs.set('batch', String(batch));
+
+    const r = await fetch('/skyaware.metar/config', { method:'POST', body: qs });
+    if (!r.ok) throw new Error(await r.text());
+    showErr('Saved ✔︎');
+    setTimeout(hideErr, 1000);
+  }catch(e){
+    showErr('Save failed: ' + e.message);
+  }
+};
+
 async function refreshCats(){
   try{
     let r = await fetch('/skyaware.api/cats'); 
@@ -423,6 +487,7 @@ async function refreshCats(){
 
 refresh().catch(e=>showErr(e.message));
 loadMapProfileUI().catch(e=>showErr(e.message));
+loadMetarSettings().catch(()=>{});
 </script>
 </body>
 </html>
@@ -450,6 +515,12 @@ public:
     uint16_t remaining=0;
     bool phase=false;
   } _blink;
+
+  // ---- tiny public helper so callbacks don't touch privates directly ----
+  void cacheSetAndRepaint(const String& icaoUpper, SkyCat c, uint32_t ts) {
+    _catCache.upsert(icaoUpper.c_str(), c, ts);
+    repaintIcao(icaoUpper);
+  }
 
   void addToConfig(JsonObject& root) override { (void)root; } // no generic WLED UI
 
@@ -915,6 +986,7 @@ public:
 
     enforceOwnOn();
     registerHTTP();
+    MetarFetcher_begin(server, this, cbCollectIcaos, cbApplyCategory);
     repaintAllFromCats(); // paint whatever we have
     initialized = true;
   }
@@ -936,6 +1008,7 @@ public:
         }
       }
     }
+    MetarFetcher_tick(this); // ctx unused; kept for symmetry
   }
 
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
@@ -943,6 +1016,27 @@ public:
 private:
   SkyCatCache _catCache; // bounded last-known categories
 };
+
+// === Metar fetcher callbacks (defined AFTER class & enums are known) ===
+static void cbCollectIcaos(void* ctx, std::vector<String>& out) {
+  auto* self = (SkyAwareUsermod*)ctx;
+  out.clear();
+  for (const auto& segPair : self->segMap) {
+    const auto& inner = segPair.second;
+    for (const auto& ledPair : inner) {
+      const String& ap = ledPair.second;
+      if (ap.equalsIgnoreCase("SKIP")) continue;
+      String v = ap; v.trim(); v.toUpperCase();
+      if (v.length() == 4) out.push_back(v);
+    }
+  }
+}
+
+static void cbApplyCategory(void* ctx, const String& icaoUpper, const String& catStr, uint32_t ts) {
+  auto* self = (SkyAwareUsermod*)ctx;
+  SkyCat c = strToCat(catStr);
+  self->cacheSetAndRepaint(icaoUpper, c, ts);
+}
 
 // Global instance + registration
 SkyAwareUsermod skyAware;
